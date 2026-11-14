@@ -1,0 +1,52 @@
+{
+  "name": "conveyor-queue",
+  "version": "0.1.0",
+  "description": "A self-hosted background job queue and worker service for Node.js, backed by SQLite.",
+  "license": "MIT",
+  "author": "Vignesh Theyagarajan",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vigneshtheyagarajan/conveyor.git"
+  },
+  "homepage": "https://github.com/vigneshtheyagarajan/conveyor#readme",
+  "bugs": {
+    "url": "https://github.com/vigneshtheyagarajan/conveyor/issues"
+  },
+  "keywords": [
+    "job-queue",
+    "background-jobs",
+    "worker",
+    "scheduler",
+    "cron",
+    "sqlite",
+    "typescript"
+  ],
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "conveyor": "dist/cli/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "tsx src/cli/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "rm -rf dist coverage"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.2.7"
+  }
+}
