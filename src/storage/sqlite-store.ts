@@ -16,7 +16,7 @@ import type {
 import type { BackoffStrategy } from "../util/backoff.js";
 import { safeParse, type Json } from "../util/json.js";
 import { MIGRATIONS } from "./migrations.js";
-import { emptyCounts, type ActivateParams, type ClaimCandidateQuery, type Store } from "./store.js";
+import { emptyCounts, type ActivateParams, type ClaimCandidateQuery, type NewJobEvent, type Store } from "./store.js";
 
 type Row = Record<string, SQLInputValue>;
 
@@ -62,6 +62,13 @@ export class SqliteStore implements Store {
 
   async migrate(): Promise<number> {
     const current = Number((this.db.prepare("PRAGMA user_version").get() as Row).user_version);
+    if (current > MIGRATIONS.length) {
+      // Written by a newer release; running older code against it could corrupt data.
+      throw new Error(
+        `database schema version ${current} is newer than this version of Conveyor supports (${MIGRATIONS.length}); ` +
+          "upgrade Conveyor to open it",
+      );
+    }
     for (let i = current; i < MIGRATIONS.length; i++) {
       this.db.exec("BEGIN");
       try {
@@ -82,6 +89,23 @@ export class SqliteStore implements Store {
   }
 
   async insertJob(job: Job): Promise<void> {
+    this.insertJobRow(job);
+  }
+
+  async insertJobs(jobs: Job[], events: NewJobEvent[]): Promise<void> {
+    // Synchronous from BEGIN to COMMIT, so no other caller's writes can land inside it.
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const job of jobs) this.insertJobRow(job);
+      for (const e of events) this.insertEventRow(e.jobId, e.type, e.data, e.at);
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  private insertJobRow(job: Job): void {
     this.run(
       `INSERT INTO jobs (id, queue, name, payload, state, priority, attempts, max_attempts, backoff,
         timeout_ms, run_at, created_at, updated_at, started_at, finished_at, worker_id, lease_token,
@@ -295,10 +319,11 @@ export class SqliteStore implements Store {
     ).map(toJob);
   }
 
+  /** Hand the job back untouched: it keeps its place, and the claim's attempt is returned. */
   async releaseLease(id: string, now: number): Promise<void> {
     this.run(
       `UPDATE jobs SET state = 'waiting', updated_at = ?, worker_id = NULL, lease_token = NULL,
-         lease_expires_at = NULL
+         lease_expires_at = NULL, attempts = MAX(attempts - 1, 0)
        WHERE id = ?`,
       now,
       id,
@@ -316,10 +341,11 @@ export class SqliteStore implements Store {
     return Number(res.changes);
   }
 
+  /** Retention: deletes completed and cancelled jobs. Dead jobs are kept for inspection. */
   async deleteFinishedBefore(ts: number, limit: number): Promise<number> {
     const res = this.run(
       `DELETE FROM jobs WHERE id IN (
-         SELECT id FROM jobs WHERE state IN ('completed', 'dead', 'cancelled') AND finished_at < ?
+         SELECT id FROM jobs WHERE state IN ('completed', 'cancelled') AND finished_at < ?
          LIMIT ?)`,
       ts,
       limit,
@@ -336,6 +362,10 @@ export class SqliteStore implements Store {
   }
 
   async appendJobEvent(jobId: string, type: string, data: Json | null, at: number): Promise<void> {
+    this.insertEventRow(jobId, type, data, at);
+  }
+
+  private insertEventRow(jobId: string, type: string, data: Json | null, at: number): void {
     this.run(
       "INSERT INTO job_events (job_id, type, data, at) VALUES (?, ?, ?, ?)",
       jobId,
@@ -524,6 +554,14 @@ export class SqliteStore implements Store {
     return this.all(
       "SELECT * FROM webhook_deliveries WHERE webhook_id = ? ORDER BY created_at DESC LIMIT ?",
       webhookId,
+      limit,
+    ).map(toDelivery);
+  }
+
+  async findPendingDeliveries(limit: number): Promise<WebhookDelivery[]> {
+    return this.all(
+      `SELECT * FROM webhook_deliveries WHERE status = 'pending'
+        ORDER BY next_attempt_at, created_at, id LIMIT ?`,
       limit,
     ).map(toDelivery);
   }

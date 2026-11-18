@@ -8,7 +8,8 @@ export interface MaintenanceOptions {
   batchSize?: number;
 }
 
-// reaper: expired leases -> waiting, promoter: delayed -> waiting, janitor: retention
+// reaper: expired leases -> waiting, promoter: delayed -> waiting,
+// janitor: retention for completed and cancelled jobs (dead jobs are kept)
 export class Maintenance {
   private timers: NodeJS.Timeout[] = [];
   private running = false;

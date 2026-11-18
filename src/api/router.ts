@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { ApiToken, Scope } from "../core/types.js";
+import { ValidationError } from "../core/errors.js";
 
 export interface RequestContext {
   req: IncomingMessage;
@@ -76,9 +77,17 @@ export class Router {
         continue;
       }
       const params: Record<string, string> = {};
-      route.keys.forEach((k, i) => (params[k] = decodeURIComponent(m[i + 1]!)));
+      route.keys.forEach((k, i) => (params[k] = decodeParam(m[i + 1]!)));
       return { route, params };
     }
     return allowed.length ? { allowed } : undefined;
+  }
+}
+
+function decodeParam(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    throw new ValidationError("malformed percent-encoding in URL path");
   }
 }

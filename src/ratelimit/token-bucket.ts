@@ -10,9 +10,11 @@ export class TokenBucket {
     readonly capacity: number,
     readonly intervalMs: number,
     private clock: Clock = systemClock,
+    /** Tokens to start with (default: full). Capped at capacity. */
+    initialTokens = capacity,
   ) {
     if (capacity <= 0 || intervalMs <= 0) throw new RangeError("capacity and intervalMs must be positive");
-    this.tokens = capacity;
+    this.tokens = Math.max(0, Math.min(capacity, initialTokens));
     this.lastRefill = clock.now();
   }
 

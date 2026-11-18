@@ -20,6 +20,13 @@ export interface ClaimCandidateQuery {
   exclude?: string[];
 }
 
+export interface NewJobEvent {
+  jobId: string;
+  type: string;
+  data: Json | null;
+  at: number;
+}
+
 export interface ActivateParams {
   workerId: string;
   leaseToken: string;
@@ -34,6 +41,8 @@ export interface Store {
 
   // jobs
   insertJob(job: Job): Promise<void>;
+  /** Insert jobs and events in one transaction: either everything is stored or nothing is. */
+  insertJobs(jobs: Job[], events: NewJobEvent[]): Promise<void>;
   getJob(id: string): Promise<Job | undefined>;
   findActiveByUniqueKey(queue: string, uniqueKey: string): Promise<Job | undefined>;
   listJobs(filter: JobFilter): Promise<Page<Job>>;
@@ -50,8 +59,10 @@ export interface Store {
   cancelJob(id: string, now: number): Promise<void>;
   requeueJob(id: string, now: number, resetAttempts: boolean): Promise<void>;
   findExpiredLeases(now: number, limit: number): Promise<Job[]>;
+  /** Back to waiting without counting the claim: attempts goes down by one (not below 0). */
   releaseLease(id: string, now: number): Promise<void>;
   promoteDelayed(now: number, limit: number): Promise<number>;
+  /** Deletes completed and cancelled jobs finished before `ts`. Dead jobs are kept. */
   deleteFinishedBefore(ts: number, limit: number): Promise<number>;
   hasUnfinishedForSchedule(scheduleId: string): Promise<boolean>;
 
@@ -81,6 +92,8 @@ export interface Store {
   insertDelivery(delivery: WebhookDelivery): Promise<void>;
   updateDelivery(delivery: WebhookDelivery): Promise<void>;
   listDeliveries(webhookId: string, limit: number): Promise<WebhookDelivery[]>;
+  /** Deliveries still to be (re)tried, across all webhooks, soonest `nextAttemptAt` first. */
+  findPendingDeliveries(limit: number): Promise<WebhookDelivery[]>;
 
   // tokens
   insertToken(token: ApiToken): Promise<void>;

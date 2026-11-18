@@ -27,6 +27,29 @@ export interface ConveyorOptions {
 
 const MAX_PRIORITY = 1000;
 
+/**
+ * Latest run time a job can have: the last instant whose ISO-8601 form has a four-digit year
+ * (the API renders times that way). Earliest is the Unix epoch.
+ */
+export const MAX_RUN_AT = Date.UTC(9999, 11, 31, 23, 59, 59, 999);
+
+/**
+ * Longest delay accepted anywhere a delay is given (delayMs, retryInMs, backoff settings):
+ * 100 years. That keeps every computed run time far inside MAX_RUN_AT, and a longer delay is
+ * almost certainly a unit mistake.
+ */
+export const MAX_DELAY_MS = 100 * 365.25 * 24 * 60 * 60 * 1000;
+
+const RUN_AT_RANGE = `between ${new Date(0).toISOString()} and ${new Date(MAX_RUN_AT).toISOString()}`;
+
+/** Throws a ValidationError unless `value` is a delay between 0 and MAX_DELAY_MS. */
+export function assertDelay(value: unknown, name: string): void {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new ValidationError(`${name} must be a non-negative number`);
+  }
+  if (value > MAX_DELAY_MS) throw new ValidationError(`${name} must be at most ${MAX_DELAY_MS} (100 years)`);
+}
+
 // Producer-side API
 export class Conveyor {
   readonly store: Store;
@@ -48,15 +71,59 @@ export class Conveyor {
   }
 
   async enqueue(req: EnqueueRequest): Promise<Job> {
-    this.validate(req);
-    const queue = await this.queueSettings(req.queue);
-    if (req.uniqueKey) {
-      const existing = await this.store.findActiveByUniqueKey(req.queue, req.uniqueKey);
-      if (existing) return existing;
-    }
+    const [job] = await this.enqueueMany([req]);
+    return job!;
+  }
+
+  /**
+   * Enqueue several jobs atomically: if any request is invalid or the insert fails, no job is
+   * stored. Unique keys are de-duplicated within the batch as well as against existing jobs.
+   */
+  async enqueueBulk(reqs: EnqueueRequest[]): Promise<Job[]> {
+    if (reqs.length > 1000) throw new ValidationError("at most 1000 jobs per bulk request");
+    return this.enqueueMany(reqs);
+  }
+
+  private async enqueueMany(reqs: EnqueueRequest[]): Promise<Job[]> {
+    reqs.forEach((r) => this.validate(r));
     const now = this.clock.now();
+    const results: Job[] = [];
+    const created: Job[] = [];
+    const byUniqueKey = new Map<string, Job>();
+    const queues = new Map<string, QueueSettings>();
+
+    for (const req of reqs) {
+      const key = req.uniqueKey ? `${req.queue}\u0000${req.uniqueKey}` : undefined;
+      if (key) {
+        const existing = byUniqueKey.get(key) ?? (await this.store.findActiveByUniqueKey(req.queue, req.uniqueKey!));
+        if (existing) {
+          byUniqueKey.set(key, existing);
+          results.push(existing);
+          continue;
+        }
+      }
+      let queue = queues.get(req.queue);
+      if (!queue) queues.set(req.queue, (queue = await this.queueSettings(req.queue)));
+      const job = this.newJob(req, queue, now);
+      if (key) byUniqueKey.set(key, job);
+      created.push(job);
+      results.push(job);
+    }
+
+    await this.store.insertJobs(
+      created,
+      created.map((job) => ({ jobId: job.id, type: "enqueued", data: { state: job.state }, at: now })),
+    );
+    for (const job of created) {
+      this.events.emit("job.enqueued", job);
+      this.logger.debug("job enqueued", { jobId: job.id, queue: job.queue, name: job.name });
+    }
+    return results;
+  }
+
+  private newJob(req: EnqueueRequest, queue: QueueSettings, now: number): Job {
     const runAt = req.runAt ?? now + (req.delayMs ?? 0);
-    const job: Job = {
+    return {
       id: jobId(now),
       queue: req.queue,
       name: req.name,
@@ -81,19 +148,6 @@ export class Conveyor {
       uniqueKey: req.uniqueKey ?? null,
       scheduleId: req.scheduleId ?? null,
     };
-    await this.store.insertJob(job);
-    await this.store.appendJobEvent(job.id, "enqueued", { state: job.state }, now);
-    this.events.emit("job.enqueued", job);
-    this.logger.debug("job enqueued", { jobId: job.id, queue: job.queue, name: job.name });
-    return job;
-  }
-
-  async enqueueBulk(reqs: EnqueueRequest[]): Promise<Job[]> {
-    if (reqs.length > 1000) throw new ValidationError("at most 1000 jobs per bulk request");
-    reqs.forEach((r) => this.validate(r));
-    const jobs: Job[] = [];
-    for (const req of reqs) jobs.push(await this.enqueue(req));
-    return jobs;
   }
 
   async getJob(id: string): Promise<Job> {
@@ -218,8 +272,16 @@ export class Conveyor {
     if (req.maxAttempts !== undefined && (!Number.isInteger(req.maxAttempts) || req.maxAttempts < 1)) {
       throw new ValidationError("maxAttempts must be a positive integer");
     }
-    if (req.delayMs !== undefined && (!Number.isFinite(req.delayMs) || req.delayMs < 0)) {
-      throw new ValidationError("delayMs must be a non-negative number");
+    if (req.runAt !== undefined) {
+      if (!Number.isFinite(req.runAt)) throw new ValidationError("runAt must be a finite timestamp (ms since epoch)");
+      if (req.runAt < 0 || req.runAt > MAX_RUN_AT) throw new ValidationError(`runAt must be ${RUN_AT_RANGE}`);
+    }
+    if (req.delayMs !== undefined) assertDelay(req.delayMs, "delayMs");
+    if (req.backoff) {
+      const b = req.backoff as unknown as Record<string, unknown>;
+      for (const key of ["delayMs", "stepMs", "baseMs", "maxMs"]) {
+        if (key in b) assertDelay(b[key], `backoff.${key}`);
+      }
     }
     if (req.timeoutMs !== undefined && (!Number.isFinite(req.timeoutMs) || req.timeoutMs < 0)) {
       throw new ValidationError("timeoutMs must be a non-negative number");

@@ -5,7 +5,7 @@ import type { Logger } from "../core/logger.js";
 import type { OverlapPolicy, Schedule } from "../core/types.js";
 import type { Json } from "../util/json.js";
 import { NAME_PATTERN } from "../util/validate.js";
-import { isValidTimezone, nextRun, parseCron } from "./cron.js";
+import { isValidTimezone, nextRun, parseCron, upcomingRuns } from "./cron.js";
 
 export interface ScheduleInput {
   name: string;
@@ -55,8 +55,13 @@ export class Scheduler {
     const due = await this.store.findDueSchedules(now, 100);
     const fired: string[] = [];
     for (const schedule of due) {
-      const jobId = await this.fire(schedule);
-      if (jobId) fired.push(jobId);
+      // One broken schedule must not stop the others. It stays due and is retried next tick.
+      try {
+        const jobId = await this.fire(schedule);
+        if (jobId) fired.push(jobId);
+      } catch (err) {
+        this.logger.error("schedule failed to fire", { schedule: schedule.name, scheduleId: schedule.id, err });
+      }
     }
     return fired;
   }
@@ -82,7 +87,10 @@ export class Scheduler {
       ...schedule,
       lastRunAt: schedule.nextRunAt,
       lastJobId: jobId ?? schedule.lastJobId,
-      nextRunAt: nextRun(schedule.cron, schedule.nextRunAt, schedule.timezone),
+      // The next slot after *now*, not after the slot that just fired: after downtime the
+      // schedule runs once and continues from the next future slot instead of once per
+      // missed slot.
+      nextRunAt: nextRun(schedule.cron, Math.max(now, schedule.nextRunAt), schedule.timezone),
       updatedAt: now,
     };
     await this.store.updateSchedule(updated);
@@ -129,6 +137,9 @@ export class Scheduler {
       overlap: patch.overlap ?? current.overlap,
     };
     this.validate(merged);
+    if (merged.name !== current.name && (await this.store.getScheduleByName(merged.name))) {
+      throw new ConflictError(`schedule ${merged.name} already exists`);
+    }
     const now = this.conveyor.clock.now();
     const timingChanged =
       merged.cron !== current.cron || merged.timezone !== current.timezone || (merged.enabled && !current.enabled);
@@ -146,6 +157,11 @@ export class Scheduler {
     const s = await this.store.getSchedule(id);
     if (!s) throw new NotFoundError(`schedule ${id} not found`);
     return s;
+  }
+
+  /** The next `count` run times of a schedule, from now (Conveyor's clock). */
+  upcoming(schedule: Schedule, count = 5): number[] {
+    return upcomingRuns(schedule.cron, this.conveyor.clock.now(), schedule.timezone, count);
   }
 
   list(): Promise<Schedule[]> {
@@ -178,8 +194,14 @@ export class Scheduler {
     } catch (err) {
       throw new ValidationError((err as Error).message);
     }
-    if (input.timezone && !isValidTimezone(input.timezone)) {
+    if (input.timezone !== undefined && !isValidTimezone(input.timezone)) {
       throw new ValidationError(`unknown timezone ${input.timezone}`);
+    }
+    try {
+      nextRun(input.cron, this.conveyor.clock.now(), input.timezone || "UTC");
+    } catch {
+      // e.g. "0 0 30 2 *": valid syntax, but there is no 30 February.
+      throw new ValidationError(`cron expression "${input.cron}" never runs`);
     }
     if (input.overlap && input.overlap !== "allow" && input.overlap !== "skip") {
       throw new ValidationError("overlap must be 'allow' or 'skip'");

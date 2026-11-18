@@ -34,7 +34,7 @@ export class ManualClock implements Clock {
 
   setTimeout(fn: () => void, ms: number): TimerHandle {
     const id = this.nextId++;
-    this.timers.set(id, { at: this.current + Math.max(0, ms), fn });
+    this.timers.set(id, { at: this.current + nodeDelay(ms), fn });
     return { id };
   }
 
@@ -66,6 +66,13 @@ export class ManualClock implements Clock {
   pendingTimers(): number {
     return this.timers.size;
   }
+}
+
+const TIMEOUT_MAX = 2 ** 31 - 1;
+
+/** Node's setTimeout treats delays below 1ms, above TIMEOUT_MAX, or NaN as 1ms. */
+function nodeDelay(ms: number): number {
+  return ms >= 1 && ms <= TIMEOUT_MAX ? ms : 1;
 }
 
 export function sleep(ms: number, signal?: AbortSignal): Promise<void> {

@@ -3,7 +3,6 @@ import type { Scope } from "../../core/types.js";
 import { NotFoundError, ValidationError } from "../../core/errors.js";
 import type { ScheduleInput, Scheduler } from "../../scheduler/scheduler.js";
 import type { WebhookDispatcher } from "../../webhooks/dispatcher.js";
-import { upcomingRuns } from "../../scheduler/cron.js";
 import type { Json } from "../../util/json.js";
 import { asObject, bool, str, strArray } from "../../util/validate.js";
 import { createToken } from "../auth.js";
@@ -42,7 +41,7 @@ export function registerScheduleRoutes(router: Router, scheduler: Scheduler): vo
     "/v1/schedules/:id",
     async ({ params }) => {
       const s = await scheduler.get(params.id!);
-      return { body: { ...scheduleView(s), upcoming: upcomingRuns(s.cron, Date.now(), s.timezone).map((t) => new Date(t).toISOString()) } };
+      return { body: { ...scheduleView(s), upcoming: scheduler.upcoming(s).map((t) => new Date(t).toISOString()) } };
     },
     "jobs:read",
   );

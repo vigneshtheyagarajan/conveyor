@@ -17,6 +17,9 @@ export interface WebhookInput {
 
 export type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
 
+/** At most this many pending deliveries are resumed by start(). */
+const RESUME_LIMIT = 10_000;
+
 const JOB_EVENTS = [
   "job.enqueued",
   "job.completed",
@@ -49,6 +52,32 @@ export class WebhookDispatcher {
         }),
       );
     }
+    this.track(this.resumePending());
+  }
+
+  /**
+   * Pick up deliveries that were still pending when the process last stopped, each at its
+   * stored next attempt time (immediately if that has passed).
+   */
+  private async resumePending(): Promise<void> {
+    const pending = await this.conveyor.store.findPendingDeliveries(RESUME_LIMIT);
+    if (pending.length === RESUME_LIMIT) {
+      this.logger.warn("more pending webhook deliveries than can be resumed at once", { resumed: RESUME_LIMIT });
+    }
+    const now = this.conveyor.clock.now();
+    for (const delivery of pending) {
+      this.scheduleRetry(delivery.webhookId, delivery, Math.max(0, (delivery.nextAttemptAt ?? now) - now));
+    }
+    if (pending.length) this.logger.info("resuming pending webhook deliveries", { count: pending.length });
+  }
+
+  private scheduleRetry(webhookId: string, delivery: WebhookDelivery, delayMs: number): void {
+    const t = setTimeout(() => {
+      this.retryTimers.delete(t);
+      this.track(this.retry(webhookId, delivery));
+    }, delayMs);
+    t.unref();
+    this.retryTimers.add(t);
   }
 
   async stop(): Promise<void> {
@@ -163,15 +192,20 @@ export class WebhookDispatcher {
       } else {
         const delay = backoffDelay({ type: "exponential", baseMs: 2000, maxMs: 300_000, jitter: true }, delivery.attempts);
         delivery.nextAttemptAt = now + delay;
-        const t = setTimeout(() => {
-          this.retryTimers.delete(t);
-          this.track(this.attempt(hook, delivery));
-        }, delay);
-        t.unref();
-        this.retryTimers.add(t);
+        this.scheduleRetry(hook.id, delivery, delay);
       }
     }
     await store.updateDelivery(delivery);
+  }
+
+  /** Retry with the webhook's current state; give up quietly if it was deleted or disabled. */
+  private async retry(webhookId: string, delivery: WebhookDelivery): Promise<void> {
+    const hook = await this.conveyor.store.getWebhook(webhookId);
+    if (!hook || !hook.enabled) {
+      this.logger.info("webhook removed or disabled; not retrying", { webhookId, deliveryId: delivery.id });
+      return;
+    }
+    await this.attempt(hook, delivery);
   }
 
   async create(input: WebhookInput): Promise<Webhook> {
@@ -188,7 +222,12 @@ export class WebhookDispatcher {
       throw new ValidationError("events must be a non-empty array");
     }
     for (const e of input.events) {
-      if (e !== "*" && !ALL_EVENTS.includes(e as EventName)) throw new ValidationError(`unknown event ${e}`);
+      if (e === "*" || (JOB_EVENTS as readonly string[]).includes(e)) continue;
+      if (ALL_EVENTS.includes(e as EventName)) {
+        // A real event, but only job lifecycle events are sent to webhooks.
+        throw new ValidationError(`event ${e} is not delivered to webhooks; use one of ${JOB_EVENTS.join(", ")} or *`);
+      }
+      throw new ValidationError(`unknown event ${e}`);
     }
     const hook: Webhook = {
       id: randomUUID(),

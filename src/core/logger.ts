@@ -18,7 +18,9 @@ export function createLogger(
   const threshold = ORDER[level];
   const emit = (lvl: Exclude<LogLevel, "silent">, msg: string, fields?: Record<string, unknown>) => {
     if (ORDER[lvl] < threshold) return;
-    const record: Record<string, unknown> = { ts: new Date().toISOString(), level: lvl, msg, ...base, ...fields };
+    // Core keys first, and they always win over fields with the same name.
+    const core = { ts: new Date().toISOString(), level: lvl, msg };
+    const record: Record<string, unknown> = { ...core, ...base, ...fields, ...core };
     if (record.err instanceof Error) {
       const e = record.err;
       record.err = { name: e.name, message: e.message, stack: e.stack };

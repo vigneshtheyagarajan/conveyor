@@ -114,4 +114,8 @@ export const MIGRATIONS: string[] = [
     revoked_at INTEGER
   );
   `,
+  // 7 - find pending webhook deliveries to resume after a restart
+  `
+  CREATE INDEX idx_deliveries_pending ON webhook_deliveries (status, next_attempt_at);
+  `,
 ];

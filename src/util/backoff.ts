@@ -22,12 +22,19 @@ export function backoffDelay(
     case "linear":
       return Math.min(strategy.stepMs * attempt, strategy.maxMs);
     case "exponential": {
-      const raw = Math.min(strategy.baseMs * 2 ** (attempt - 1), strategy.maxMs);
+      // A zero base stays zero (0 * 2 ** 1024 would be 0 * Infinity = NaN).
+      const raw = strategy.baseMs === 0 ? 0 : Math.min(strategy.baseMs * 2 ** (attempt - 1), strategy.maxMs);
       if (!strategy.jitter) return raw;
       // full jitter between 50% and 100% of the computed delay
       return Math.round(raw / 2 + random() * (raw / 2));
     }
   }
+}
+
+function jitterFlag(value: unknown): boolean {
+  if (value === undefined || value === null) return true;
+  if (typeof value !== "boolean") throw new TypeError("backoff.jitter must be a boolean");
+  return value;
 }
 
 export function parseBackoff(value: unknown): BackoffStrategy | undefined {
@@ -51,7 +58,7 @@ export function parseBackoff(value: unknown): BackoffStrategy | undefined {
         type: "exponential",
         baseMs: num("baseMs"),
         maxMs: num("maxMs"),
-        jitter: v.jitter === undefined ? true : Boolean(v.jitter),
+        jitter: jitterFlag(v.jitter),
       };
     default:
       throw new TypeError(`unknown backoff type: ${String(v.type)}`);

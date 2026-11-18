@@ -1,15 +1,18 @@
 #!/usr/bin/env node
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { Broker } from "../broker/broker.js";
 import { Maintenance } from "../broker/maintenance.js";
 import { loadConfig } from "../core/config.js";
 import { Conveyor } from "../core/conveyor.js";
 import { createLogger } from "../core/logger.js";
-import type { JobState, Scope } from "../core/types.js";
+import { JOB_STATES, type JobState, type Scope } from "../core/types.js";
 import { createRuntime } from "../runtime.js";
 import { Scheduler } from "../scheduler/scheduler.js";
 import { SqliteStore } from "../storage/sqlite-store.js";
 import { createToken } from "../api/auth.js";
+import { NotFoundError } from "../core/errors.js";
 import { HandlerRegistry } from "../worker/handlers.js";
 import { Worker } from "../worker/worker.js";
 import { print, table } from "./output.js";
@@ -51,7 +54,18 @@ Global options
   --json          machine-readable output
 `;
 
-async function main(argv: string[]): Promise<number> {
+/** Run the CLI. Returns the process exit code; errors are reported on stderr. */
+export async function main(argv: string[]): Promise<number> {
+  try {
+    return await run(argv);
+  } catch (err) {
+    process.stderr.write(`error: ${err instanceof Error ? err.message : String(err)}\n`);
+    if (err instanceof UsageError) process.stderr.write("run `conveyor --help` for usage\n");
+    return 1;
+  }
+}
+
+async function run(argv: string[]): Promise<number> {
   const { values, positionals } = parseArgs({
     args: argv,
     allowPositionals: true,
@@ -84,15 +98,20 @@ async function main(argv: string[]): Promise<number> {
   });
 
   const [command, ...args] = positionals;
-  if (values.help || !command) {
+  if (values.help) {
     process.stdout.write(HELP);
-    return command ? 0 : 1;
+    return 0;
+  }
+  if (!command) {
+    process.stdout.write(HELP);
+    return 1;
   }
 
   const json = values.json!;
+  const port = int(values.port, "--port", { min: 0, max: 65535 });
   const overrides = {
     ...(values.db ? { dbPath: values.db } : {}),
-    ...(values.port ? { port: Number(values.port) } : {}),
+    ...(port !== undefined ? { port } : {}),
     ...(values.host ? { host: values.host } : {}),
   };
 
@@ -110,7 +129,7 @@ async function main(argv: string[]): Promise<number> {
   const store = new SqliteStore(config.dbPath);
   const conveyor = new Conveyor({ store, config, logger });
   await conveyor.init();
-  const num = (v: string | undefined) => (v === undefined ? undefined : Number(v));
+  const num = (flag: keyof typeof values, opts?: { min?: number }) => int(values[flag] as string | undefined, `--${flag}`, opts);
   const need = (v: string | undefined, what: string) => {
     if (!v) throw new UsageError(`${what} is required`);
     return v;
@@ -123,11 +142,12 @@ async function main(argv: string[]): Promise<number> {
         return 0;
 
       case "worker": {
+        const concurrency = num("concurrency", { min: 1 }) ?? 1;
         const handlers = await HandlerRegistry.fromModule(need(values.handlers, "--handlers"));
         const queues = need(values.queues, "--queues").split(",").map((q) => q.trim());
         const broker = new Broker(conveyor);
         const maintenance = new Maintenance(conveyor);
-        const worker = new Worker(broker, { queues, handlers, concurrency: num(values.concurrency) ?? 1 });
+        const worker = new Worker(broker, { queues, handlers, concurrency });
         maintenance.start();
         worker.start();
         await waitForSignal();
@@ -142,8 +162,8 @@ async function main(argv: string[]): Promise<number> {
           queue: need(queue, "queue"),
           name: need(name, "job name"),
           payload: values.payload ? JSON.parse(values.payload) : null,
-          delayMs: num(values.delay),
-          priority: num(values.priority),
+          delayMs: num("delay", { min: 0 }),
+          priority: num("priority"),
           uniqueKey: values.unique,
         });
         print(json ? job : `enqueued ${job.id} (${job.state})`, json);
@@ -151,10 +171,13 @@ async function main(argv: string[]): Promise<number> {
       }
 
       case "jobs": {
+        if (values.state !== undefined && !JOB_STATES.includes(values.state as JobState)) {
+          throw new UsageError(`--state must be one of ${JOB_STATES.join(", ")}; got "${values.state}"`);
+        }
         const page = await conveyor.listJobs({
           queue: values.queue,
           state: values.state as JobState | undefined,
-          limit: num(values.limit) ?? 20,
+          limit: num("limit", { min: 1 }) ?? 20,
         });
         print(json ? page : table(page.items as never, ["id", "queue", "name", "state", "attempts", "runAt", "lastError"]), json);
         return 0;
@@ -172,13 +195,17 @@ async function main(argv: string[]): Promise<number> {
         return 0;
       }
 
-      case "cancel":
-        print(json ? await conveyor.cancel(need(args[0], "job id")) : "cancelled", json);
+      case "cancel": {
+        const job = await conveyor.cancel(need(args[0], "job id"));
+        print(json ? job : "cancelled", json);
         return 0;
+      }
 
-      case "retry":
-        print(json ? await conveyor.retry(need(args[0], "job id")) : "requeued", json);
+      case "retry": {
+        const job = await conveyor.retry(need(args[0], "job id"));
+        print(json ? job : "requeued", json);
         return 0;
+      }
 
       case "queues": {
         const queues = await conveyor.listQueues();
@@ -200,10 +227,10 @@ async function main(argv: string[]): Promise<number> {
       case "queue-set": {
         const patch = Object.fromEntries(
           Object.entries({
-            concurrency: num(values.concurrency),
-            rateLimitMax: num(values["rate-max"]),
-            rateLimitIntervalMs: num(values["rate-interval"]),
-            defaultMaxAttempts: num(values["max-attempts"]),
+            concurrency: num("concurrency", { min: 0 }),
+            rateLimitMax: num("rate-max", { min: 0 }),
+            rateLimitIntervalMs: num("rate-interval", { min: 0 }),
+            defaultMaxAttempts: num("max-attempts", { min: 1 }),
           }).filter(([, v]) => v !== undefined),
         );
         print(await conveyor.updateQueue(need(args[0], "queue"), patch), json);
@@ -216,7 +243,7 @@ async function main(argv: string[]): Promise<number> {
           print(`retried ${await conveyor.retryAllDead(queue)} jobs`, json);
           return 0;
         }
-        const page = await conveyor.listJobs({ queue, state: "dead", limit: num(values.limit) ?? 50 });
+        const page = await conveyor.listJobs({ queue, state: "dead", limit: num("limit", { min: 1 }) ?? 50 });
         print(json ? page : table(page.items as never, ["id", "name", "attempts", "finishedAt", "lastError"]), json);
         return 0;
       }
@@ -259,10 +286,12 @@ async function main(argv: string[]): Promise<number> {
         return 0;
       }
 
-      case "token-revoke":
-        await store.revokeToken(need(args[0], "token id"), Date.now());
+      case "token-revoke": {
+        const id = need(args[0], "token id");
+        if (!(await store.revokeToken(id, Date.now()))) throw new NotFoundError(`token ${id} not found`);
         print("revoked", json);
         return 0;
+      }
 
       default:
         throw new UsageError(`unknown command ${command}`);
@@ -273,6 +302,16 @@ async function main(argv: string[]): Promise<number> {
 }
 
 class UsageError extends Error {}
+
+/** Parse an integer option strictly: "abc", "", "1.5" and "1e3" are errors, not NaN or 0. */
+function int(value: string | undefined, flag: string, opts: { min?: number; max?: number } = {}): number | undefined {
+  if (value === undefined) return undefined;
+  if (!/^-?\d+$/.test(value.trim())) throw new UsageError(`${flag} must be an integer, got "${value}"`);
+  const n = Number(value);
+  if (opts.min !== undefined && n < opts.min) throw new UsageError(`${flag} must be >= ${opts.min}, got ${n}`);
+  if (opts.max !== undefined && n > opts.max) throw new UsageError(`${flag} must be <= ${opts.max}, got ${n}`);
+  return n;
+}
 
 function waitForSignal(): Promise<void> {
   return new Promise((resolve) => {
@@ -286,11 +325,15 @@ function waitForSignal(): Promise<void> {
   });
 }
 
-main(process.argv.slice(2)).then(
-  (code) => process.exit(code),
-  (err) => {
-    process.stderr.write(`error: ${err instanceof Error ? err.message : String(err)}\n`);
-    if (err instanceof UsageError) process.stderr.write("run `conveyor --help` for usage\n");
-    process.exit(1);
-  },
-);
+/** True when this file is the program being run (directly, or through the npm bin symlink). */
+function isEntryPoint(): boolean {
+  try {
+    return process.argv[1] !== undefined && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryPoint()) {
+  void main(process.argv.slice(2)).then((code) => process.exit(code));
+}

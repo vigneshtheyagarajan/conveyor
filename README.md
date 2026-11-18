@@ -79,9 +79,9 @@ Delivery is **at-least-once**. Write idempotent handlers. See [docs/architecture
 | Option | Default | Description |
 | --- | --- | --- |
 | `priority` | `0` | -1000..1000, higher first |
-| `delayMs` / `runAt` | now | Earliest run time |
+| `delayMs` / `runAt` | now | Earliest run time. `delayMs` is at most 100 years; `runAt` must be between 1970-01-01 and 9999-12-31T23:59:59.999Z |
 | `maxAttempts` | queue default (3) | Including the first attempt |
-| `backoff` | exponential 1s → 10m, jitter | `{type: "fixed"|"linear"|"exponential", ...}` |
+| `backoff` | exponential 1s → 10m, jitter | `{type: "fixed"|"linear"|"exponential", ...}`; each delay setting is at most 100 years |
 | `timeoutMs` | `0` (none) | Per-attempt limit; the handler's signal aborts |
 | `uniqueKey` | – | Return the existing job while one with this key is unfinished |
 
@@ -129,6 +129,9 @@ Errors use one shape: `{"error": {"code": "validation_error", "message": "..."}}
 
 ### Webhook signatures
 
+Webhooks can subscribe to `job.enqueued`, `job.completed`, `job.failed`,
+`job.retrying`, `job.dead` and `job.cancelled`, or `*` for all of them.
+
 Each delivery carries `conveyor-signature: t=<unix>,v1=<hex>`, where `v1` is
 HMAC-SHA256 of `"<t>.<raw body>"` using the webhook secret. Verify it with
 `verifyWebhook(secret, rawBody, header)` from this package.
@@ -161,7 +164,7 @@ Environment variables (see `.env.example`):
 | `CONVEYOR_SCHEDULER_INTERVAL_MS` | `1000` |
 | `CONVEYOR_WEBHOOK_TIMEOUT_MS` | `5000` |
 | `CONVEYOR_WEBHOOK_MAX_ATTEMPTS` | `5` |
-| `CONVEYOR_RETENTION_MS` | 7 days (`0` keeps finished jobs forever) |
+| `CONVEYOR_RETENTION_MS` | 7 days. Completed and cancelled jobs older than this are deleted; dead jobs are kept. `0` keeps everything |
 | `CONVEYOR_MAX_PAYLOAD_BYTES` | `262144` |
 
 ## Development

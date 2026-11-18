@@ -100,6 +100,8 @@ export class ApiServer {
         this.send(res, status, { error: { code: err.code, message: err.message } }, requestId);
       } else if (err instanceof BodyError) {
         status = err.status;
+        // The rest of an oversized upload is discarded; don't reuse the connection for it.
+        if (status === 413) res.setHeader("connection", "close");
         this.send(res, status, { error: { code: "bad_request", message: err.message } }, requestId);
       } else {
         status = 500;
@@ -131,16 +133,24 @@ export class ApiServer {
     return new Promise((resolve, reject) => {
       const chunks: Buffer[] = [];
       let size = 0;
+      let tooLarge = false;
+      const refuse = () => {
+        tooLarge = true;
+        chunks.length = 0;
+        // Keep reading (and discarding) the upload rather than destroying the socket, so the
+        // client gets the 413 response instead of a connection reset.
+        req.resume();
+        reject(new BodyError(413, `body exceeds ${this.maxBodyBytes} bytes`));
+      };
+      if (Number(req.headers["content-length"]) > this.maxBodyBytes) refuse();
       req.on("data", (chunk: Buffer) => {
+        if (tooLarge) return;
         size += chunk.length;
-        if (size > this.maxBodyBytes) {
-          reject(new BodyError(413, `body exceeds ${this.maxBodyBytes} bytes`));
-          req.destroy();
-          return;
-        }
+        if (size > this.maxBodyBytes) return refuse();
         chunks.push(chunk);
       });
       req.on("end", () => {
+        if (tooLarge) return;
         if (size === 0) return resolve(undefined);
         const type = req.headers["content-type"] ?? "";
         if (!type.includes("application/json")) {

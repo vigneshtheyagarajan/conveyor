@@ -1,5 +1,19 @@
 // minute hour day-of-month month day-of-week, plus names, ranges, steps and @macros.
-// Like Vixie cron, if both day fields are restricted either one matching is enough.
+//
+// Day matching follows Vixie cron. A day field that starts with "*" is unrestricted, even
+// with a step such as "*/2". If both day fields are restricted, a day matching either one
+// is enough ("0 0 13 * FRI" = the 13th or any Friday). Otherwise a day must match both
+// ("0 0 */2 * MON" = odd-numbered days that are also Mondays).
+//
+// Times are wall-clock times in the schedule's timezone. Around daylight-saving changes:
+//  - Interval expressions (the minute or hour field starts with "*", e.g. "*/15 * * * *",
+//    "0 * * * *") run at every instant whose local time matches. Times skipped when clocks
+//    go forward do not run; times repeated when clocks go back run again, so the job keeps
+//    its real-time rhythm.
+//  - Fixed-time expressions (neither field starts with "*", e.g. "30 2 * * *") run once a
+//    day as expected: a time that happens twice runs only the first time, and a time that
+//    is skipped runs once at the moment the clocks jump.
+// The same rules, with examples, are in docs/architecture.md ("Daylight-saving time").
 
 export interface CronExpression {
   source: string;
@@ -10,6 +24,8 @@ export interface CronExpression {
   daysOfWeek: Set<number>;
   domRestricted: boolean;
   dowRestricted: boolean;
+  /** Neither the minute nor the hour field starts with "*" (see DST notes above). */
+  fixedTime: boolean;
 }
 
 export class CronParseError extends Error {
@@ -66,8 +82,9 @@ export function parseCron(source: string): CronExpression {
     daysOfMonth: sets[2]!,
     months: sets[3]!,
     daysOfWeek: dow,
-    domRestricted: parts[2] !== "*",
-    dowRestricted: parts[4] !== "*",
+    domRestricted: !parts[2]!.startsWith("*"),
+    dowRestricted: !parts[4]!.startsWith("*"),
+    fixedTime: !parts[0]!.startsWith("*") && !parts[1]!.startsWith("*"),
   };
 }
 
@@ -75,7 +92,9 @@ function parseField(source: string, field: string, spec: FieldSpec): Set<number>
   const out = new Set<number>();
   for (const item of field.split(",")) {
     if (item === "") throw new CronParseError(source, `empty item in ${spec.name}`);
-    const [rangePart, stepPart] = item.split("/");
+    const slashParts = item.split("/");
+    if (slashParts.length > 2) throw new CronParseError(source, `"${item}" has more than one step in ${spec.name}`);
+    const [rangePart, stepPart] = slashParts;
     let step = 1;
     if (stepPart !== undefined) {
       step = Number(stepPart);
@@ -87,7 +106,9 @@ function parseField(source: string, field: string, spec: FieldSpec): Set<number>
       lo = spec.min;
       hi = spec.name === "day-of-week" ? 6 : spec.max;
     } else if (rangePart!.includes("-")) {
-      const [a, b] = rangePart!.split("-");
+      const bounds = rangePart!.split("-");
+      if (bounds.length > 2) throw new CronParseError(source, `range ${rangePart} has more than two bounds in ${spec.name}`);
+      const [a, b] = bounds;
       lo = value(source, a!, spec);
       hi = value(source, b!, spec);
       if (lo > hi) throw new CronParseError(source, `range ${rangePart} is backwards in ${spec.name}`);
@@ -152,24 +173,36 @@ export function tzOffsetMs(timeZone: string, at: number): number {
 }
 
 const MINUTE = 60_000;
-const MAX_SEARCH_MINUTES = 5 * 366 * 24 * 60;
+const HOUR = 60 * MINUTE;
+const SEARCH_YEARS = 5;
+/** Larger than any real DST shift (at most 2h), and than any gap between a shift's effects. */
+const DST_WINDOW = 3 * HOUR;
+/** UTC offsets range from -12h to +14h, so a wall time maps to an instant within this of it. */
+const MAX_OFFSET = 14 * HOUR;
 
 function dayMatches(expr: CronExpression, d: Date): boolean {
   const dom = expr.daysOfMonth.has(d.getUTCDate());
   const dow = expr.daysOfWeek.has(d.getUTCDay());
   if (expr.domRestricted && expr.dowRestricted) return dom || dow;
-  if (expr.domRestricted) return dom;
-  if (expr.dowRestricted) return dow;
-  return true;
+  // An unrestricted ("*...") field still has to match: "*/2" only allows every other day.
+  return dom && dow;
 }
 
 export function nextRun(expr: CronExpression | string, after: number, timeZone = "UTC"): number {
   const cron = typeof expr === "string" ? parseCron(expr) : expr;
-  const offset = tzOffsetMs(timeZone, after);
+  const offsetAt = (t: number) => tzOffsetMs(timeZone, t);
 
-  // Work in "wall clock as UTC" space, starting at the next whole minute.
-  let local = Math.floor((after + offset) / MINUTE) * MINUTE + MINUTE;
-  for (let i = 0; i < MAX_SEARCH_MINUTES; i++) {
+  // Walk candidate wall-clock times ("wall clock as UTC" values) in increasing order. When
+  // clocks go back shortly after `after`, some later instants have earlier wall-clock times,
+  // so start from the smaller of the offsets in effect now and just after.
+  let local = Math.floor((after + Math.min(offsetAt(after), offsetAt(after + DST_WINDOW))) / MINUTE) * MINUTE;
+  const horizon = new Date(local);
+  horizon.setUTCFullYear(horizon.getUTCFullYear() + SEARCH_YEARS);
+
+  let best: number | undefined;
+  // Once a run is found, only wall times below this can still map to an earlier instant.
+  let stopAt = Infinity;
+  while (local <= horizon.getTime() && local < stopAt) {
     const d = new Date(local);
     if (!cron.months.has(d.getUTCMonth() + 1)) {
       local = Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1);
@@ -187,9 +220,54 @@ export function nextRun(expr: CronExpression | string, after: number, timeZone =
       local += MINUTE;
       continue;
     }
-    return local - offset;
+    const run = runFor(cron, local, after, offsetAt);
+    if (run !== undefined && (best === undefined || run < best)) {
+      best = run;
+      stopAt = best + Math.max(offsetAt(best), offsetAt(best - DST_WINDOW));
+    }
+    local += MINUTE;
   }
-  throw new Error(`no run time found for "${cron.source}" within 5 years`);
+  if (best === undefined) {
+    throw new Error(`no run time found for "${cron.source}" within ${SEARCH_YEARS} years`);
+  }
+  return best;
+}
+
+/** The run (if any, and after `after`) for a matching wall-clock time. */
+function runFor(
+  cron: CronExpression,
+  local: number,
+  after: number,
+  offsetAt: (t: number) => number,
+): number | undefined {
+  const offsets = new Set([offsetAt(local - MAX_OFFSET), offsetAt(local), offsetAt(local + MAX_OFFSET)]);
+  // Instants whose wall-clock time is `local`: none in a DST gap, two in an overlap.
+  const instants = [...offsets]
+    .map((o) => local - o)
+    .filter((u) => offsetAt(u) === local - u)
+    .sort((a, b) => a - b);
+
+  if (instants.length === 0) {
+    if (!cron.fixedTime) return undefined;
+    const jump = gapEnd(local, [...offsets], offsetAt);
+    return jump > after ? jump : undefined;
+  }
+  if (cron.fixedTime) return instants[0]! > after ? instants[0] : undefined;
+  return instants.find((u) => u > after);
+}
+
+/** First instant after the DST gap that swallowed wall-clock time `local`. */
+function gapEnd(local: number, offsets: number[], offsetAt: (t: number) => number): number {
+  // Mapped with the later (larger) offset, `local` lands before the jump; with the earlier one, after it.
+  let lo = local - Math.max(...offsets);
+  let hi = local - Math.min(...offsets);
+  const before = offsetAt(lo);
+  while (hi - lo > MINUTE) {
+    const mid = lo + Math.floor((hi - lo) / 2 / MINUTE) * MINUTE;
+    if (offsetAt(mid) === before) lo = mid;
+    else hi = mid;
+  }
+  return hi;
 }
 
 /** The next `count` run times, for previews. */

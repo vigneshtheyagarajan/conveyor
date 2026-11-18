@@ -1,20 +1,28 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { HandlerRegistry } from "../../src/worker/handlers.js";
 import { Worker } from "../../src/worker/worker.js";
-import { setup, waitFor } from "../helpers.js";
+import { manualClock, setup } from "../helpers.js";
 
 describe("job lifecycle", () => {
   it("runs a job to completion", async () => {
-    const { conveyor, broker } = await setup();
-    const handlers = new HandlerRegistry().register<{ a: number; b: number }>("add", ({ job }) => ({
-      sum: job.payload.a + job.payload.b,
-    }));
-    const worker = new Worker(broker, { queues: ["math"], handlers, pollMs: 10 });
-    worker.start();
-    const job = await conveyor.enqueue({ queue: "math", name: "add", payload: { a: 2, b: 3 } });
-    await waitFor(async () => (await conveyor.getJob(job.id)).state === "completed");
-    expect((await conveyor.getJob(job.id)).result).toEqual({ sum: 5 });
-    await worker.stop();
+    // The worker polls with real timers; fake them so the test does not sleep.
+    vi.useFakeTimers();
+    try {
+      const { conveyor, broker } = await setup({ clock: manualClock() });
+      const handlers = new HandlerRegistry().register<{ a: number; b: number }>("add", ({ job }) => ({
+        sum: job.payload.a + job.payload.b,
+      }));
+      const worker = new Worker(broker, { queues: ["math"], handlers, pollMs: 10 });
+      worker.start();
+      const job = await conveyor.enqueue({ queue: "math", name: "add", payload: { a: 2, b: 3 } });
+      await vi.advanceTimersByTimeAsync(50);
+      expect(await conveyor.getJob(job.id)).toMatchObject({ state: "completed", result: { sum: 5 } });
+      const stopped = worker.stop();
+      await vi.advanceTimersByTimeAsync(50);
+      await stopped;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("moves a job to dead after maxAttempts", async () => {

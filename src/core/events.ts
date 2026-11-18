@@ -18,7 +18,11 @@ export interface ConveyorEvents {
 
 export type EventName = keyof ConveyorEvents;
 
-/** Typed wrapper over EventEmitter. Listener errors are isolated. */
+/**
+ * Typed wrapper over EventEmitter. Listener errors are isolated: a listener that throws, or an
+ * async listener whose promise rejects, is reported to onListenerError and never reaches the
+ * emitter or the process.
+ */
 export class EventBus {
   private emitter = new EventEmitter();
 
@@ -27,11 +31,13 @@ export class EventBus {
   }
 
   on<E extends EventName>(event: E, listener: (...args: ConveyorEvents[E]) => void): () => void {
+    const report = (err: unknown) => this.emitter.emit("listenerError", err, event);
     const wrapped = (...args: unknown[]) => {
       try {
-        listener(...(args as ConveyorEvents[E]));
+        const result: unknown = listener(...(args as ConveyorEvents[E]));
+        if (isThenable(result)) result.then(undefined, report);
       } catch (err) {
-        this.emitter.emit("listenerError", err, event);
+        report(err);
       }
     };
     this.emitter.on(event, wrapped);
@@ -52,6 +58,10 @@ export class EventBus {
   emit<E extends EventName>(event: E, ...args: ConveyorEvents[E]): void {
     this.emitter.emit(event, ...args);
   }
+}
+
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return typeof (value as PromiseLike<unknown> | null)?.then === "function";
 }
 
 export const ALL_EVENTS: EventName[] = [

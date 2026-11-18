@@ -24,7 +24,9 @@ export class LocalRateLimiter implements RateLimiter {
     }
     let bucket = this.buckets.get(q.name);
     if (!bucket || bucket.capacity !== q.rateLimitMax || bucket.intervalMs !== q.rateLimitIntervalMs) {
-      bucket = new TokenBucket(q.rateLimitMax, q.rateLimitIntervalMs, this.clock);
+      // Carry unused tokens over so that changing the limit doesn't grant a fresh burst.
+      const carried = bucket?.available();
+      bucket = new TokenBucket(q.rateLimitMax, q.rateLimitIntervalMs, this.clock, carried);
       this.buckets.set(q.name, bucket);
     }
     return bucket;

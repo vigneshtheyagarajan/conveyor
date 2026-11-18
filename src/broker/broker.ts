@@ -1,5 +1,5 @@
-import type { Conveyor } from "../core/conveyor.js";
-import { LeaseLostError, NotFoundError, UnrecoverableError } from "../core/errors.js";
+import { assertDelay, type Conveyor } from "../core/conveyor.js";
+import { LeaseLostError, NotFoundError, UnrecoverableError, ValidationError } from "../core/errors.js";
 import type { Job, QueueSettings } from "../core/types.js";
 import { LocalRateLimiter, type RateLimiter } from "../ratelimit/limiter.js";
 import { backoffDelay, DEFAULT_BACKOFF } from "../util/backoff.js";
@@ -97,6 +97,9 @@ export class Broker {
   }
 
   async progress(jobId: string, token: string, progress: number): Promise<void> {
+    if (typeof progress !== "number" || !Number.isFinite(progress)) {
+      throw new ValidationError("progress must be a finite number");
+    }
     const job = await this.owned(jobId, token);
     const clamped = Math.max(0, Math.min(1, progress));
     await this.store.updateProgress(jobId, clamped, this.clock.now());
@@ -114,6 +117,7 @@ export class Broker {
   }
 
   async fail(jobId: string, token: string, error: unknown, opts: FailOptions = {}): Promise<Job> {
+    if (opts.retryInMs !== undefined) assertDelay(opts.retryInMs, "retryInMs");
     const job = await this.owned(jobId, token);
     const message = errorMessage(error);
     const now = this.clock.now();
@@ -146,12 +150,17 @@ export class Broker {
   }
 }
 
+/** A string describing any thrown value, so every failure can be recorded. */
 export function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message || error.name;
   if (typeof error === "string") return error;
+  if (typeof error === "function") return error.name ? `[function ${error.name}]` : "[function]";
   try {
-    return JSON.stringify(error);
+    // undefined for undefined and symbols; throws for BigInt and circular values
+    const json = JSON.stringify(error);
+    if (json !== undefined) return json;
   } catch {
-    return String(error);
+    // fall through
   }
+  return String(error);
 }

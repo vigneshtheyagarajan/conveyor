@@ -13,7 +13,7 @@ export interface ConveyorConfig {
   schedulerIntervalMs: number;
   webhookTimeoutMs: number;
   webhookMaxAttempts: number;
-  /** Completed jobs older than this are deleted by the janitor. 0 disables. */
+  /** Completed and cancelled jobs older than this are deleted by the janitor (dead jobs are kept). 0 disables. */
   retentionMs: number;
   maxPayloadBytes: number;
 }
@@ -47,11 +47,13 @@ export function loadConfig(
   env: NodeJS.ProcessEnv = process.env,
   overrides: Partial<ConveyorConfig> = {},
 ): ConveyorConfig {
-  const level = (env.CONVEYOR_LOG_LEVEL ?? DEFAULT_CONFIG.logLevel) as LogLevel;
+  const level = (env.CONVEYOR_LOG_LEVEL || DEFAULT_CONFIG.logLevel) as LogLevel;
   if (!LEVELS.includes(level)) throw new Error(`invalid CONVEYOR_LOG_LEVEL: ${level}`);
   const config: ConveyorConfig = {
-    dbPath: env.CONVEYOR_DB ?? DEFAULT_CONFIG.dbPath,
-    host: env.CONVEYOR_HOST ?? DEFAULT_CONFIG.host,
+    // || not ??: an empty value means "unset". "" would open a temporary database or
+    // listen on every interface.
+    dbPath: env.CONVEYOR_DB || DEFAULT_CONFIG.dbPath,
+    host: env.CONVEYOR_HOST || DEFAULT_CONFIG.host,
     port: numEnv(env, "CONVEYOR_PORT", DEFAULT_CONFIG.port),
     logLevel: level,
     leaseMs: numEnv(env, "CONVEYOR_LEASE_MS", DEFAULT_CONFIG.leaseMs),

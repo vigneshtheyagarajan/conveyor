@@ -3,7 +3,6 @@ import { hostname } from "node:os";
 import type { Broker, Lease } from "../broker/broker.js";
 import { LeaseLostError, UnrecoverableError } from "../core/errors.js";
 import type { Logger } from "../core/logger.js";
-import { sleep } from "../util/clock.js";
 import type { Json } from "../util/json.js";
 import type { HandlerRegistry, JobContext } from "./handlers.js";
 
@@ -26,6 +25,14 @@ export class JobTimeoutError extends Error {
   constructor(ms: number) {
     super(`job timed out after ${ms}ms`);
     this.name = "JobTimeoutError";
+  }
+}
+
+/** The abort reason handlers see when stop() gives up waiting for them. */
+export class WorkerShutdownError extends Error {
+  constructor() {
+    super("worker shutting down");
+    this.name = "WorkerShutdownError";
   }
 }
 
@@ -100,11 +107,16 @@ export class Worker {
     this.unsubscribe?.();
 
     const inFlight = [...this.running.values()].map((r) => r.done);
-    const timeout = sleep(this.opts.shutdownTimeoutMs).then(() => "timeout" as const);
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), this.opts.shutdownTimeoutMs);
+    });
     const result = await Promise.race([Promise.all(inFlight).then(() => "done" as const), timeout]);
+    // Don't leave the timer armed: it would keep the process alive after stop().
+    clearTimeout(timer);
     if (result === "timeout") {
       this.logger.warn("shutdown timeout reached, aborting running jobs", { running: this.running.size });
-      for (const r of this.running.values()) r.controller.abort(new Error("worker shutting down"));
+      for (const r of this.running.values()) r.controller.abort(new WorkerShutdownError());
     }
     await Promise.all(this.loops);
     this.state = "stopped";
@@ -125,6 +137,13 @@ export class Worker {
         idleMs = Math.min(idleMs * 2, this.opts.maxPollMs);
         continue;
       }
+      if (this.state !== "running") {
+        // stop() was called while this claim was in progress: hand the job back unrun.
+        await this.broker.release(lease.job.id, lease.token).catch((err) => {
+          this.logger.error("could not release job claimed during shutdown", { err, jobId: lease!.job.id });
+        });
+        break;
+      }
       idleMs = this.opts.pollMs;
       await this.execute(lease);
     }
@@ -132,8 +151,10 @@ export class Worker {
 
   private idle(ms: number): Promise<void> {
     return new Promise((resolve) => {
-      const t = setTimeout(done, ms);
       const stop = this.stopController.signal;
+      // stop() may already have fired while this loop was claiming; its abort event is gone.
+      if (stop.aborted) return resolve();
+      const t = setTimeout(done, ms);
       function done() {
         clearTimeout(t);
         stop.removeEventListener("abort", done);
@@ -181,24 +202,30 @@ export class Worker {
       };
 
       const run = Promise.resolve().then(() => handler(ctx));
-      let result: Json | void;
+      // Stop waiting as soon as the job is aborted (timeout, lost lease, forced shutdown), even
+      // if the handler ignores its signal. Its eventual result is then discarded.
+      const aborted = new Promise<never>((_, reject) => {
+        controller.signal.addEventListener("abort", () => reject(controller.signal.reason), { once: true });
+      });
       if (job.timeoutMs > 0) {
-        const timedOut = new Promise<never>((_, reject) => {
-          timeout = setTimeout(() => {
-            const err = new JobTimeoutError(job.timeoutMs);
-            controller.abort(err);
-            reject(err);
-          }, job.timeoutMs);
-        });
-        result = await Promise.race([run, timedOut]);
-      } else {
-        result = await run;
+        timeout = setTimeout(() => controller.abort(new JobTimeoutError(job.timeoutMs)), job.timeoutMs);
       }
+      const result: Json | void = await Promise.race([run, aborted]);
 
       await this.broker.complete(job.id, token, result ?? null);
       this.processedCount++;
       log.info("job completed", { durationMs: Date.now() - started });
     } catch (err) {
+      if (controller.signal.reason instanceof WorkerShutdownError) {
+        // Shutting down is not the job's fault: hand it back without using up an attempt.
+        try {
+          await this.broker.release(job.id, token);
+          log.info("job released on shutdown");
+        } catch (releaseErr) {
+          log.error("could not release job on shutdown", { err: releaseErr });
+        }
+        return;
+      }
       this.failedCount++;
       if (err instanceof LeaseLostError) {
         log.warn("job finished after its lease was lost; result discarded");
