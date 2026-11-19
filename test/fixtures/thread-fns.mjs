@@ -46,3 +46,8 @@ export function crashLater() {
   }, 0);
   return new Promise(() => {});
 }
+
+/** Reports exactly what it was called with. */
+export function args(...received) {
+  return { count: received.length, received };
+}

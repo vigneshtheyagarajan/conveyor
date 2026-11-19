@@ -2,16 +2,26 @@ import { ConflictError, NotFoundError, QueuePausedError, ValidationError } from 
 import { EventBus } from "./events.js";
 import { silentLogger, type Logger } from "./logger.js";
 import { DEFAULT_CONFIG, type ConveyorConfig } from "./config.js";
+import { randomUUID } from "node:crypto";
+import { dependencyResult, type DependencyResult } from "./dependencies.js";
+import { flowStatus, MAX_DEPENDENCIES, planFlow, stateCounts } from "./flow.js";
 import type {
+  DependencyEdge,
+  DependencyInput,
   EnqueueRequest,
+  FailurePolicy,
+  Flow,
+  FlowOutcome,
+  FlowRequest,
   Job,
+  LinkedJob,
   JobFilter,
   Page,
   QueueSettings,
   QueueStats,
 } from "./types.js";
-import { TERMINAL_STATES } from "./types.js";
-import type { Store } from "../storage/store.js";
+import { FAILURE_POLICIES } from "./types.js";
+import type { JobTransition, Store } from "../storage/store.js";
 import { systemClock, type Clock } from "../util/clock.js";
 import { jobId } from "../util/ids.js";
 import { DEFAULT_BACKOFF } from "../util/backoff.js";
@@ -26,6 +36,11 @@ export interface ConveyorOptions {
 }
 
 const MAX_PRIORITY = 1000;
+
+export { MAX_DEPENDENCIES, MAX_FLOW_JOBS } from "./flow.js";
+
+/** Largest page of GET /v1/jobs/:id/dependencies. */
+const MAX_DEPENDENCY_PAGE = 500;
 
 /**
  * Latest run time a job can have: the last instant whose ISO-8601 form has a four-digit year
@@ -85,14 +100,15 @@ export class Conveyor {
   }
 
   private async enqueueMany(reqs: EnqueueRequest[]): Promise<Job[]> {
-    reqs.forEach((r) => this.validate(r));
+    const deps = reqs.map((r) => this.validate(r));
     const now = this.clock.now();
     const results: Job[] = [];
     const created: Job[] = [];
+    const edges: DependencyEdge[] = [];
     const byUniqueKey = new Map<string, Job>();
     const queues = new Map<string, QueueSettings>();
 
-    for (const req of reqs) {
+    for (const [i, req] of reqs.entries()) {
       const key = req.uniqueKey ? `${req.queue}\u0000${req.uniqueKey}` : undefined;
       if (key) {
         const existing = byUniqueKey.get(key) ?? (await this.store.findActiveByUniqueKey(req.queue, req.uniqueKey!));
@@ -104,31 +120,37 @@ export class Conveyor {
       }
       let queue = queues.get(req.queue);
       if (!queue) queues.set(req.queue, (queue = await this.queueSettings(req.queue)));
-      const job = this.newJob(req, queue, now);
+      const job = this.newJob(req, queue, now, deps[i]!.length > 0);
+      for (const d of deps[i]!) edges.push({ childId: job.id, parentId: d.jobId, onFailure: d.onFailure });
       if (key) byUniqueKey.set(key, job);
       created.push(job);
       results.push(job);
     }
 
-    await this.store.insertJobs(
+    // Dependencies are checked and settled inside the insert's transaction: a job whose
+    // dependencies have all finished already comes back unblocked.
+    const settled = await this.store.insertJobs(
       created,
       created.map((job) => ({ jobId: job.id, type: "enqueued", data: { state: job.state }, at: now })),
+      edges,
     );
     for (const job of created) {
       this.events.emit("job.enqueued", job);
       this.logger.debug("job enqueued", { jobId: job.id, queue: job.queue, name: job.name });
     }
-    return results;
+    this.announce(settled);
+    const latest = new Map(settled.map((t) => [t.job.id, t.job]));
+    return results.map((job) => latest.get(job.id) ?? job);
   }
 
-  private newJob(req: EnqueueRequest, queue: QueueSettings, now: number): Job {
+  private newJob(req: EnqueueRequest, queue: QueueSettings, now: number, blocked: boolean): Job {
     const runAt = req.runAt ?? now + (req.delayMs ?? 0);
     return {
       id: jobId(now),
       queue: req.queue,
       name: req.name,
       payload: req.payload ?? null,
-      state: runAt > now ? "delayed" : "waiting",
+      state: blocked ? "blocked" : runAt > now ? "delayed" : "waiting",
       priority: req.priority ?? 0,
       attempts: 0,
       maxAttempts: req.maxAttempts ?? queue.defaultMaxAttempts,
@@ -147,7 +169,138 @@ export class Conveyor {
       lastError: null,
       uniqueKey: req.uniqueKey ?? null,
       scheduleId: req.scheduleId ?? null,
+      flowId: null,
+      flowKey: null,
+      terminatedBy: null,
     };
+  }
+
+  /** Emit flow.completed / flow.failed for verdicts a transition recorded. Call after it committed. */
+  announceFlows(outcomes: FlowOutcome[]): void {
+    for (const outcome of outcomes) {
+      this.events.emit(outcome.event, outcome);
+      this.logger.info(outcome.event, { flowId: outcome.flowId, reason: outcome.reason, jobId: outcome.jobId });
+    }
+  }
+
+  /**
+   * Emit the events for jobs a transition changed as a side effect: dependents unblocked or
+   * cancelled, and dependents brought back by a retry. Call after the transition committed.
+   */
+  announce(transitions: JobTransition[]): void {
+    for (const { job, from, cause, blockedMs } of transitions) {
+      if (job.state === "cancelled") {
+        this.events.emit("job.cancelled", job);
+        this.logger.info("job cancelled by its dependency", { jobId: job.id, dependencyId: cause });
+      } else if (from === "blocked") {
+        this.events.emit("job.unblocked", job, blockedMs ?? 0);
+      } else {
+        this.events.emit("job.enqueued", job);
+      }
+    }
+  }
+
+  /**
+   * Submit a flow: jobs that depend on each other by key, and on existing jobs by id. Either
+   * the whole flow is stored or, if anything is wrong with it, nothing is: see planFlow for the
+   * structural checks. A `fail` dependency on an existing job that is already dead or
+   * cancelled is a ConflictError; with `ignore` or `continue` it counts as settled at once.
+   */
+  async enqueueFlow(req: FlowRequest): Promise<Flow> {
+    const plan = planFlow(req);
+    for (const node of plan.jobs) {
+      try {
+        this.validate({ ...node, dependsOn: undefined });
+      } catch (err) {
+        // validate() only throws ValidationErrors; name the job it was about.
+        throw new ValidationError(`job ${node.key}: ${(err as Error).message}`);
+      }
+    }
+    const now = this.clock.now();
+    const flowId = randomUUID();
+    const blocked = new Set(plan.edges.map((e) => e.childKey));
+    const queues = new Map<string, QueueSettings>();
+    const ids = new Map<string, string>();
+    const jobs: Job[] = [];
+    for (const node of plan.jobs) {
+      let queue = queues.get(node.queue);
+      if (!queue) queues.set(node.queue, (queue = await this.queueSettings(node.queue)));
+      const { key, dependsOn: _deps, ...req } = node;
+      // Created in dependency order, so ids (which sort by creation) do too.
+      const job = { ...this.newJob(req, queue, now, blocked.has(key)), flowId, flowKey: key };
+      ids.set(key, job.id);
+      jobs.push(job);
+    }
+    const dependencies: DependencyEdge[] = plan.edges.map((e) => ({
+      childId: ids.get(e.childKey)!,
+      parentId: "key" in e.parent ? ids.get(e.parent.key)! : e.parent.jobId,
+      onFailure: e.onFailure,
+    }));
+    const settled = await this.store.insertFlow({
+      id: flowId,
+      jobs,
+      dependencies,
+      events: jobs.map((job) => ({ jobId: job.id, type: "enqueued", data: { state: job.state, flowId }, at: now })),
+    });
+    for (const job of jobs) this.events.emit("job.enqueued", job);
+    this.announce(settled);
+    this.logger.debug("flow enqueued", { flowId, jobs: jobs.length });
+    return this.getFlow(flowId);
+  }
+
+  async getFlow(id: string): Promise<Flow> {
+    const jobs = await this.store.listFlowJobs(id);
+    if (jobs.length === 0) throw new NotFoundError(`flow ${id} not found`);
+    return {
+      id,
+      status: flowStatus(jobs),
+      outcome: (await this.store.getFlowOutcome(id)) ?? null,
+      counts: stateCounts(jobs),
+      jobs,
+      edges: await this.store.listFlowDependencies(id),
+    };
+  }
+
+  /**
+   * Cancel every unfinished job of a flow, running ones included (their workers find out at
+   * their next heartbeat). Jobs outside the flow that depend on them are settled by their
+   * policies. A ConflictError if every job has already finished.
+   */
+  async cancelFlow(id: string): Promise<Flow> {
+    const res = await this.store.cancelFlow(id, this.clock.now());
+    if (!res) throw new NotFoundError(`flow ${id} not found`);
+    if (res.jobs.length === 0) throw new ConflictError(`flow ${id} has already finished`);
+    for (const t of res.jobs) this.events.emit("job.cancelled", t.job);
+    this.announce(res.dependents);
+    this.announceFlows(res.flowOutcomes);
+    return this.getFlow(id);
+  }
+
+  /**
+   * Every dependency of a job as it sees them, with results: what ctx.dependency(key) looks up.
+   * ctx.dependencies() is this filtered by isVisibleToDependent.
+   */
+  async dependencyResults(job: Job): Promise<DependencyResult[]> {
+    return (await this.store.listDependencyJobs(job.id)).map((link) => dependencyResult(job, link));
+  }
+
+  /**
+   * A page of a job's dependencies with results, ordered by id: what GET
+   * /v1/jobs/:id/dependencies returns. By default it is what the job itself sees (`ignore`
+   * dependencies that ended dead or cancelled are left out); `all` includes them.
+   */
+  async dependencyResultsPage(id: string, page: { cursor?: string; limit?: number; all?: boolean } = {}): Promise<Page<DependencyResult>> {
+    const job = await this.getJob(id);
+    const limit = Math.min(Math.max(page.limit ?? 50, 1), MAX_DEPENDENCY_PAGE);
+    const links = await this.store.listDependencyJobs(id, { after: page.cursor, limit: limit + 1, visibleOnly: !page.all });
+    const items = links.slice(0, limit).map((link) => dependencyResult(job, link));
+    return { items, nextCursor: links.length > limit ? items[items.length - 1]!.id : null };
+  }
+
+  /** The jobs that depend on a job, newest first. */
+  async dependents(id: string, page: { cursor?: string; limit?: number } = {}): Promise<Page<LinkedJob>> {
+    await this.getJob(id);
+    return this.store.listDependentJobs(id, page);
   }
 
   async getJob(id: string): Promise<Job> {
@@ -160,37 +313,53 @@ export class Conveyor {
     return this.store.listJobs(filter);
   }
 
+  /** Cancel an unfinished job. Its dependents are settled by their failure policies. */
   async cancel(id: string): Promise<Job> {
-    const job = await this.getJob(id);
-    if (TERMINAL_STATES.includes(job.state)) {
-      throw new ConflictError(`job ${id} is already ${job.state}`);
-    }
-    const now = this.clock.now();
-    await this.store.cancelJob(id, now);
-    await this.store.appendJobEvent(id, "cancelled", { previousState: job.state }, now);
-    const updated = await this.getJob(id);
-    this.events.emit("job.cancelled", updated);
-    return updated;
+    const res = await this.store.cancelJob(id, this.clock.now());
+    if (!res) throw new ConflictError(`job ${id} is already ${(await this.getJob(id)).state}`);
+    this.events.emit("job.cancelled", res.job);
+    this.announce(res.dependents);
+    this.announceFlows(res.flowOutcomes);
+    return res.job;
   }
 
-  /** Re-run a dead or cancelled job from scratch. */
+  /**
+   * Re-run a dead or cancelled job from scratch. Dependents that were cancelled because it
+   * failed come back too, blocked until it finishes.
+   */
   async retry(id: string): Promise<Job> {
-    const job = await this.getJob(id);
-    if (job.state !== "dead" && job.state !== "cancelled") {
+    const res = await this.store.retryJob(id, this.clock.now());
+    if (!res) {
+      const job = await this.getJob(id);
       throw new ConflictError(`only dead or cancelled jobs can be retried (job is ${job.state})`);
     }
-    const now = this.clock.now();
-    await this.store.requeueJob(id, now, true);
-    await this.store.appendJobEvent(id, "retried", { previousState: job.state }, now);
-    const updated = await this.getJob(id);
-    this.events.emit("job.enqueued", updated);
-    return updated;
+    this.events.emit("job.enqueued", res.job);
+    this.announce(res.dependents);
+    return res.job;
   }
 
+  /** Retry every dead job in a queue (up to `limit`). Returns how many were retried. */
   async retryAllDead(queue: string, limit = 1000): Promise<number> {
+    return (await this.retryDead(queue, limit)).retried;
+  }
+
+  /**
+   * Retry every dead job in a queue (up to `limit`). A job that can't be retried (a dependency
+   * it was created with no longer exists) is skipped, with the reason, and stays dead.
+   */
+  async retryDead(queue: string, limit = 1000): Promise<{ retried: number; skipped: { jobId: string; error: string }[] }> {
     const page = await this.store.listJobs({ queue, state: "dead", limit });
-    for (const job of page.items) await this.retry(job.id);
-    return page.items.length;
+    const skipped: { jobId: string; error: string }[] = [];
+    for (const job of page.items) {
+      try {
+        await this.retry(job.id);
+      } catch (err) {
+        if (!(err instanceof ConflictError)) throw err;
+        skipped.push({ jobId: job.id, error: err.message });
+        this.logger.warn("dead job not retried", { jobId: job.id, error: err.message });
+      }
+    }
+    return { retried: page.items.length - skipped.length, skipped };
   }
 
   async jobEvents(id: string) {
@@ -263,7 +432,8 @@ export class Conveyor {
     if (q.paused) throw new QueuePausedError(queue);
   }
 
-  private validate(req: EnqueueRequest): void {
+  /** Check a request; returns its dependencies in normal form. */
+  private validate(req: EnqueueRequest): { jobId: string; onFailure: FailurePolicy }[] {
     if (!req.queue || !NAME_PATTERN.test(req.queue)) throw new ValidationError("invalid queue name");
     if (!req.name || !NAME_PATTERN.test(req.name)) throw new ValidationError("invalid job name");
     if (req.priority !== undefined && (!Number.isInteger(req.priority) || Math.abs(req.priority) > MAX_PRIORITY)) {
@@ -293,5 +463,26 @@ export class Conveyor {
     if (size > this.config.maxPayloadBytes) {
       throw new ValidationError(`payload is ${size} bytes; limit is ${this.config.maxPayloadBytes}`);
     }
+    return parseDependencies(req.dependsOn);
   }
+}
+
+function parseDependencies(raw: DependencyInput[] | undefined): { jobId: string; onFailure: FailurePolicy }[] {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) throw new ValidationError("dependsOn must be an array");
+  if (raw.length > MAX_DEPENDENCIES) throw new ValidationError(`a job can have at most ${MAX_DEPENDENCIES} dependencies`);
+  const seen = new Set<string>();
+  return raw.map((entry) => {
+    const dep = typeof entry === "string" ? { jobId: entry } : entry;
+    if (typeof dep !== "object" || dep === null || typeof dep.jobId !== "string" || dep.jobId.length === 0) {
+      throw new ValidationError("each dependency must be a job id or {jobId, onFailure}");
+    }
+    const onFailure = dep.onFailure ?? "fail";
+    if (!FAILURE_POLICIES.includes(onFailure)) {
+      throw new ValidationError(`onFailure must be one of ${FAILURE_POLICIES.join(", ")}`);
+    }
+    if (seen.has(dep.jobId)) throw new ValidationError(`dependency ${dep.jobId} is listed twice`);
+    seen.add(dep.jobId);
+    return { jobId: dep.jobId, onFailure };
+  });
 }

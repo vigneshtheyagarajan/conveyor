@@ -14,7 +14,7 @@ function fakeConveyor(queues: Record<string, Partial<QueueCounts>>) {
   return { conveyor: { events, store } as unknown as Conveyor, events, queues };
 }
 
-const job = (over: Partial<Job>) => ({ queue: "q", runAt: 0, startedAt: null, finishedAt: null, ...over }) as Job;
+const job = (over: Partial<Job>) => ({ queue: "q", runAt: 0, startedAt: null, finishedAt: null, terminatedBy: null, ...over }) as Job;
 const line = (text: string, prefix: string) => text.split("\n").find((l) => l.startsWith(prefix));
 
 describe("conveyorMetrics", () => {
@@ -50,13 +50,56 @@ describe("conveyorMetrics", () => {
     expect(line(text, "conveyor_jobs_completed_total{")).toBe('conveyor_jobs_completed_total{queue="q"} 2');
   });
 
+  it("observes time spent blocked, in seconds, when a job is released", async () => {
+    const { conveyor, events } = fakeConveyor({});
+    const reg = conveyorMetrics(conveyor);
+    events.emit("job.unblocked", job({}), 2500);
+    events.emit("job.unblocked", job({}), 0); // released at insert: its dependencies had finished
+    events.emit("job.unblocked", job({ queue: "other" }), 7_200_000);
+    const text = await reg.render();
+    expect(line(text, 'conveyor_job_blocked_seconds_sum{queue="q"}')).toBe('conveyor_job_blocked_seconds_sum{queue="q"} 2.5');
+    expect(line(text, 'conveyor_job_blocked_seconds_count{queue="q"}')).toBe('conveyor_job_blocked_seconds_count{queue="q"} 2');
+    expect(line(text, 'conveyor_job_blocked_seconds_bucket{queue="q",le="1"}')).toBe('conveyor_job_blocked_seconds_bucket{queue="q",le="1"} 1');
+    expect(line(text, 'conveyor_job_blocked_seconds_bucket{queue="other",le="3600"}')).toBe('conveyor_job_blocked_seconds_bucket{queue="other",le="3600"} 0');
+    expect(line(text, 'conveyor_job_blocked_seconds_bucket{queue="other",le="14400"}')).toBe('conveyor_job_blocked_seconds_bucket{queue="other",le="14400"} 1');
+  });
+
+  it("counts jobs cancelled by a dependency, but not jobs cancelled directly", async () => {
+    const { conveyor, events } = fakeConveyor({});
+    const reg = conveyorMetrics(conveyor);
+    events.emit("job.cancelled", job({ terminatedBy: "parent" }));
+    events.emit("job.cancelled", job({ terminatedBy: "parent" }));
+    events.emit("job.cancelled", job({ terminatedBy: null }));
+    const text = await reg.render();
+    expect(line(text, "conveyor_jobs_cancelled_by_dependency_total{")).toBe('conveyor_jobs_cancelled_by_dependency_total{queue="q"} 2');
+  });
+
+  it("counts flow verdicts by event", async () => {
+    const { conveyor, events } = fakeConveyor({});
+    const reg = conveyorMetrics(conveyor);
+    const outcome = { flowId: "f", reason: null, jobId: null, at: 0, dispatchedAt: null };
+    events.emit("flow.completed", { ...outcome, event: "flow.completed" });
+    events.emit("flow.failed", { ...outcome, event: "flow.failed", reason: "dead" });
+    events.emit("flow.failed", { ...outcome, event: "flow.failed", reason: "cancelled" });
+    const text = await reg.render();
+    expect(line(text, 'conveyor_flows_finished_total{event="flow.completed"}')).toBe('conveyor_flows_finished_total{event="flow.completed"} 1');
+    expect(line(text, 'conveyor_flows_finished_total{event="flow.failed"}')).toBe('conveyor_flows_finished_total{event="flow.failed"} 2');
+  });
+
+  it("reports blocked jobs per queue in conveyor_queue_jobs", async () => {
+    const { conveyor } = fakeConveyor({ q: { blocked: 4 }, r: {} });
+    const text = await conveyorMetrics(conveyor).render();
+    expect(line(text, 'conveyor_queue_jobs{queue="q",state="blocked"}')).toBe('conveyor_queue_jobs{queue="q",state="blocked"} 4');
+    expect(line(text, 'conveyor_queue_jobs{queue="r",state="blocked"}')).toBe('conveyor_queue_jobs{queue="r",state="blocked"} 0');
+  });
+
   it("reports queue depth by state from the store at scrape time", async () => {
     const { conveyor, queues } = fakeConveyor({ q: { waiting: 3, active: 1 } });
     const reg = conveyorMetrics(conveyor);
     let text = await reg.render();
     expect(line(text, 'conveyor_queue_jobs{queue="q",state="waiting"}')).toBe('conveyor_queue_jobs{queue="q",state="waiting"} 3');
     expect(line(text, 'conveyor_queue_jobs{queue="q",state="dead"}')).toBe('conveyor_queue_jobs{queue="q",state="dead"} 0');
-    expect(text.match(/^conveyor_queue_jobs\{/gm)).toHaveLength(6);
+    expect(text.match(/^conveyor_queue_jobs\{/gm)).toHaveLength(7);
 
     delete queues.q;
     queues.r = { completed: 2 };

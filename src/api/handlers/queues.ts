@@ -29,7 +29,7 @@ export function registerQueueRoutes(router: Router, conveyor: Conveyor): void {
 
   router.post(
     "/v1/queues/:name/retry-dead",
-    async ({ params }) => ({ body: { retried: await conveyor.retryAllDead(params.name!) } }),
+    async ({ params }) => ({ body: await conveyor.retryDead(params.name!) }),
     "jobs:write",
   );
 }

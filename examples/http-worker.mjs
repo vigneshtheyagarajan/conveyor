@@ -19,8 +19,21 @@ for (;;) {
     await new Promise((r) => setTimeout(r, 1000));
     continue;
   }
-  const { job, leaseToken } = lease;
+  const { job, leaseToken, dependencies } = lease;
   console.log("processing", job.id, job.name);
+  if (dependencies.length > 0) {
+    // The lease lists the dependencies (id, key, name, state); their results come from here.
+    // A token needs the jobs:read scope as well as workers for this call.
+    const results = [];
+    for (let cursor = ""; ; ) {
+      const res = await fetch(`${base}/v1/jobs/${job.id}/dependencies?limit=500${cursor && `&cursor=${cursor}`}`, { headers });
+      const page = await res.json();
+      results.push(...page.items);
+      if (!page.nextCursor) break;
+      cursor = page.nextCursor;
+    }
+    console.log("dependencies", results.map((d) => [d.key ?? d.id, d.state, d.result]));
+  }
   try {
     await call(`/v1/jobs/${job.id}/complete`, { leaseToken, result: { handledBy: workerId } });
   } catch (err) {

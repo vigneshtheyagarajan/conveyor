@@ -10,8 +10,17 @@ import { threaded } from "../../src/worker/thread-runner.js";
 
 const FIXTURE = fileURLToPath(new URL("../fixtures/thread-fns.mjs", import.meta.url));
 
-function ctx(payload: unknown, signal = new AbortController().signal): JobContext {
-  return { job: { id: "j1", payload } as Job, signal } as JobContext;
+function ctx(payload: unknown, signal = new AbortController().signal, dependencies: unknown[] = []): JobContext & { loads: number } {
+  const c = {
+    job: { id: "j1", payload } as Job,
+    signal,
+    loads: 0,
+    dependencies: async () => {
+      c.loads++;
+      return dependencies;
+    },
+  };
+  return c as unknown as JobContext & { loads: number };
 }
 
 describe("threaded()", () => {
@@ -29,6 +38,23 @@ describe("threaded()", () => {
 
   it("turns an undefined result into null", async () => {
     expect(await threaded(FIXTURE, "nothing")(ctx(null))).toBeNull();
+  });
+
+  it("calls the function with the payload only, unless asked for dependencies", async () => {
+    const c = ctx({ n: 1 }, undefined, [{ id: "d1", result: 5 }]);
+    expect(await threaded(FIXTURE, "args")(c)).toEqual({ count: 1, received: [{ n: 1 }] });
+    expect(await threaded(FIXTURE, "args", {})(c)).toEqual({ count: 1, received: [{ n: 1 }] });
+    expect(c.loads).toBe(0); // and doesn't load them
+  });
+
+  it("passes ctx.dependencies() as the second argument with { dependencies: true }", async () => {
+    const deps = [
+      { id: "d1", key: "fetch", name: "f", queue: "q", state: "completed", onFailure: "fail", result: { bytes: 3 }, error: null },
+      { id: "d2", key: null, name: "g", queue: "q", state: "dead", onFailure: "continue", result: null, error: "boom" },
+    ];
+    const c = ctx({ n: 1 }, undefined, deps);
+    expect(await threaded(FIXTURE, "args", { dependencies: true })(c)).toEqual({ count: 2, received: [{ n: 1 }, deps] });
+    expect(c.loads).toBe(1);
   });
 
   it("rejects with the thread's error message", async () => {

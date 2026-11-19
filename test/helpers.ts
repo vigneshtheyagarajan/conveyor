@@ -6,6 +6,7 @@ import { Broker } from "../src/broker/broker.js";
 import { Conveyor } from "../src/core/conveyor.js";
 import type { ConveyorConfig } from "../src/core/config.js";
 import { createLogger, type Logger } from "../src/core/logger.js";
+import type { Job, JobEvent } from "../src/core/types.js";
 import { SqliteStore } from "../src/storage/sqlite-store.js";
 import { ManualClock, type Clock } from "../src/util/clock.js";
 
@@ -53,4 +54,27 @@ export function legacyJobId(now: number, random = randomBytes(10)): string {
     n = Math.floor(n / 32);
   }
   return ts + [...random].map((b) => ALPHA[b % 32]).join("");
+}
+
+/**
+ * The state a job's history says it is in: the state left by its last history entry that
+ * changes state. Waiting and delayed are both "queued", because promotion (delayed -> waiting)
+ * writes no entry.
+ */
+export function historyState(events: Pick<JobEvent, "type" | "data">[]): string | undefined {
+  const queued = (s: unknown) => (s === "waiting" || s === "delayed" ? "queued" : (s as string));
+  let state: string | undefined;
+  for (const { type, data } of events) {
+    const d = data as Record<string, unknown> | null;
+    if (type === "enqueued" || type === "unblocked" || type === "retried") state = queued(d?.state ?? "waiting");
+    else if (type === "claimed") state = "active";
+    else if (type === "completed" || type === "dead" || type === "cancelled") state = type;
+    else if (type === "retry_scheduled" || type === "lease_expired" || type === "released") state = "queued";
+  }
+  return state;
+}
+
+/** A job's state as historyState() names it. */
+export function rowState(job: Pick<Job, "state">): string {
+  return job.state === "waiting" || job.state === "delayed" ? "queued" : job.state;
 }

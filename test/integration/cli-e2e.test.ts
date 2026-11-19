@@ -123,6 +123,22 @@ describe("conveyor (built binary)", () => {
     expect((await withStore((s) => s.getJob(job.id)))?.state).toBe("cancelled");
   });
 
+  it("flow-submit - reads the flow from stdin", async () => {
+    const child = spawn(process.execPath, [bin, "flow-submit", "-", "--json", "--db", db], { env: env(), stdio: ["pipe", "pipe", "pipe"] });
+    children.push(child);
+    let stdout = "";
+    child.stdout!.on("data", (c) => (stdout += c));
+    const exited = new Promise<number | null>((resolve) => child.on("exit", resolve));
+    child.stdin!.end(JSON.stringify({ jobs: [{ key: "a", queue: "q", name: "x" }, { key: "b", queue: "q", name: "x", dependsOn: ["a"] }] }));
+    expect(await exited).toBe(0);
+    const flow = JSON.parse(stdout);
+    expect(flow.jobs.map((j: { flowKey: string; state: string }) => [j.flowKey, j.state])).toEqual([
+      ["a", "waiting"],
+      ["b", "blocked"],
+    ]);
+    expect((await withStore((s) => s.listFlowJobs(flow.id))).length).toBe(2);
+  });
+
   it("exits 1 with a message on stderr for bad input", async () => {
     expect(await run(["frobnicate"])).toEqual({ code: 1, stdout: "", stderr: "error: unknown command frobnicate\nrun `conveyor --help` for usage\n" });
     const nan = await run(["enqueue", "q", "x", "--delay", "abc"]);

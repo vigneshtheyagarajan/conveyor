@@ -1,4 +1,4 @@
-import type { ApiToken, Job, Schedule, Webhook } from "../core/types.js";
+import type { ApiToken, Flow, Job, LinkedJob, Schedule, Webhook } from "../core/types.js";
 
 const iso = (ms: number | null) => (ms == null ? null : new Date(ms).toISOString());
 
@@ -17,6 +17,9 @@ export function jobView(j: Job) {
     lastError: j.lastError,
     uniqueKey: j.uniqueKey,
     scheduleId: j.scheduleId,
+    flowId: j.flowId,
+    flowKey: j.flowKey,
+    terminatedBy: j.terminatedBy,
     timeoutMs: j.timeoutMs,
     runAt: iso(j.runAt),
     createdAt: iso(j.createdAt),
@@ -25,6 +28,22 @@ export function jobView(j: Job) {
     workerId: j.workerId,
     leaseExpiresAt: iso(j.leaseExpiresAt),
   };
+}
+
+/** A job at the other end of a dependency edge. */
+export function linkedJobView(l: LinkedJob) {
+  return { onFailure: l.onFailure, job: jobView(l.job) };
+}
+
+export function flowView(f: Flow) {
+  const outcome = f.outcome && {
+    event: f.outcome.event,
+    reason: f.outcome.reason,
+    jobId: f.outcome.jobId,
+    at: iso(f.outcome.at),
+    dispatchedAt: iso(f.outcome.dispatchedAt),
+  };
+  return { id: f.id, status: f.status, outcome, counts: f.counts, jobs: f.jobs.map(jobView), edges: f.edges };
 }
 
 export function scheduleView(s: Schedule) {

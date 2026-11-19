@@ -107,13 +107,12 @@ export class Broker {
   }
 
   async complete(jobId: string, token: string, result: Json | null = null): Promise<Job> {
-    await this.owned(jobId, token);
-    const now = this.clock.now();
-    await this.store.completeJob(jobId, result, now);
-    await this.store.appendJobEvent(jobId, "completed", null, now);
-    const job = (await this.store.getJob(jobId))!;
-    this.conveyor.events.emit("job.completed", job);
-    return job;
+    const res = await this.store.completeJob(jobId, token, result, this.clock.now());
+    if (!res) throw await this.leaseError(jobId);
+    this.conveyor.events.emit("job.completed", res.job);
+    this.conveyor.announce(res.dependents);
+    this.conveyor.announceFlows(res.flowOutcomes);
+    return res.job;
   }
 
   async fail(jobId: string, token: string, error: unknown, opts: FailOptions = {}): Promise<Job> {
@@ -123,30 +122,35 @@ export class Broker {
     const now = this.clock.now();
     const unrecoverable = opts.unrecoverable || error instanceof UnrecoverableError;
 
+    // `job` is only read to decide between retry and dead; the write below checks the lease
+    // again, so nothing that happened in between is overwritten.
     if (unrecoverable || job.attempts >= job.maxAttempts) {
-      await this.store.markDead(jobId, message, now);
-      await this.store.appendJobEvent(jobId, "dead", { error: message, attempts: job.attempts }, now);
-      const dead = (await this.store.getJob(jobId))!;
-      this.conveyor.events.emit("job.failed", dead, message);
-      this.conveyor.events.emit("job.dead", dead, message);
-      return dead;
+      const res = await this.store.markDead(jobId, token, message, now);
+      if (!res) throw await this.leaseError(jobId);
+      this.conveyor.events.emit("job.failed", res.job, message);
+      this.conveyor.events.emit("job.dead", res.job, message);
+      this.conveyor.announce(res.dependents);
+      this.conveyor.announceFlows(res.flowOutcomes);
+      return res.job;
     }
 
     const delay = opts.retryInMs ?? backoffDelay(job.backoff ?? DEFAULT_BACKOFF, job.attempts, this.random);
-    await this.store.scheduleRetry(jobId, message, now + delay, now);
-    await this.store.appendJobEvent(jobId, "retry_scheduled", { error: message, delayMs: delay }, now);
-    const retrying = (await this.store.getJob(jobId))!;
-    this.conveyor.events.emit("job.failed", retrying, message);
-    this.conveyor.events.emit("job.retrying", retrying, message, delay);
-    return retrying;
+    const res = await this.store.scheduleRetry(jobId, token, message, now + delay, now);
+    if (!res) throw await this.leaseError(jobId);
+    this.conveyor.events.emit("job.failed", res.job, message);
+    this.conveyor.events.emit("job.retrying", res.job, message, delay);
+    return res.job;
   }
 
   /** Give a job back without counting it as a failure (e.g. on shutdown). */
   async release(jobId: string, token: string): Promise<void> {
-    await this.owned(jobId, token);
-    const now = this.clock.now();
-    await this.store.releaseLease(jobId, now);
-    await this.store.appendJobEvent(jobId, "released", null, now);
+    const res = await this.store.releaseLease(jobId, token, this.clock.now());
+    if (!res) throw await this.leaseError(jobId);
+  }
+
+  /** Why a transition that needed the lease changed nothing. */
+  private async leaseError(jobId: string): Promise<Error> {
+    return (await this.store.getJob(jobId)) ? new LeaseLostError(jobId) : new NotFoundError(`job ${jobId} not found`);
   }
 }
 

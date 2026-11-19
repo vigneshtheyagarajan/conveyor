@@ -1,12 +1,12 @@
 import type { Conveyor } from "../../core/conveyor.js";
 import { ValidationError } from "../../core/errors.js";
-import type { EnqueueRequest, JobState } from "../../core/types.js";
+import type { DependencyInput, EnqueueRequest, JobState } from "../../core/types.js";
 import { JOB_STATES } from "../../core/types.js";
 import { parseBackoff } from "../../util/backoff.js";
 import type { Json } from "../../util/json.js";
 import { asObject, int, str } from "../../util/validate.js";
 import type { Router } from "../router.js";
-import { jobView } from "../serialize.js";
+import { jobView, linkedJobView } from "../serialize.js";
 
 export function parseEnqueue(raw: unknown): EnqueueRequest {
   const o = asObject(raw);
@@ -33,7 +33,17 @@ export function parseEnqueue(raw: unknown): EnqueueRequest {
     timeoutMs: int(o, "timeoutMs", { min: 0 }),
     uniqueKey: str(o, "uniqueKey", { max: 256 }),
     backoff,
+    // Checked by Conveyor: ids or {jobId, onFailure}.
+    dependsOn: (o.dependsOn ?? undefined) as DependencyInput[] | undefined,
   };
+}
+
+/** `limit` from a query string: a positive integer, or undefined. */
+export function limitParam(query: URLSearchParams): number | undefined {
+  if (!query.has("limit")) return undefined;
+  const limit = Number(query.get("limit"));
+  if (!Number.isInteger(limit) || limit < 1) throw new ValidationError("limit must be a positive integer");
+  return limit;
 }
 
 export function registerJobRoutes(router: Router, conveyor: Conveyor): void {
@@ -63,10 +73,7 @@ export function registerJobRoutes(router: Router, conveyor: Conveyor): void {
     async ({ query }) => {
       const state = query.get("state") ?? undefined;
       if (state && !JOB_STATES.includes(state as JobState)) throw new ValidationError(`unknown state ${state}`);
-      const limit = query.has("limit") ? Number(query.get("limit")) : undefined;
-      if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) {
-        throw new ValidationError("limit must be a positive integer");
-      }
+      const limit = limitParam(query);
       const page = await conveyor.listJobs({
         queue: query.get("queue") ?? undefined,
         state: state as JobState | undefined,
@@ -85,6 +92,33 @@ export function registerJobRoutes(router: Router, conveyor: Conveyor): void {
   router.get(
     "/v1/jobs/:id/events",
     async ({ params }) => ({ body: { items: await conveyor.jobEvents(params.id!) } }),
+    "jobs:read",
+  );
+
+  // The job's dependencies with their results, as the job sees them (the same view as an
+  // in-process handler's ctx.dependencies()). ?all=true also lists `ignore` dependencies that
+  // failed.
+  router.get(
+    "/v1/jobs/:id/dependencies",
+    async ({ params, query }) => {
+      const all = query.get("all");
+      if (all !== null && all !== "true" && all !== "false") throw new ValidationError("all must be true or false");
+      const page = await conveyor.dependencyResultsPage(params.id!, {
+        cursor: query.get("cursor") ?? undefined,
+        limit: limitParam(query),
+        all: all === "true",
+      });
+      return { body: page };
+    },
+    "jobs:read",
+  );
+
+  router.get(
+    "/v1/jobs/:id/dependents",
+    async ({ params, query }) => {
+      const page = await conveyor.dependents(params.id!, { cursor: query.get("cursor") ?? undefined, limit: limitParam(query) });
+      return { body: { items: page.items.map(linkedJobView), nextCursor: page.nextCursor } };
+    },
     "jobs:read",
   );
 

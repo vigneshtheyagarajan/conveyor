@@ -175,6 +175,31 @@ describe("running jobs", () => {
     await stopWorker(worker);
   });
 
+  it("wakes up as soon as a job it could run is unblocked", async () => {
+    const { conveyor, broker, worker, job } = await start({ x: () => "done" }, { pollMs: 10, maxPollMs: 60_000 });
+    const parent = await conveyor.enqueue({ queue: "elsewhere", name: "x" });
+    const child = await conveyor.enqueue({ queue: "q", name: "x", dependsOn: [parent.id] });
+    await advance(200_000, 1000); // idle long enough to back off to the maximum poll interval
+    expect((await job(child.id)).state).toBe("blocked");
+    const lease = await broker.claim(["elsewhere"], "other-worker");
+    await broker.complete(parent.id, lease!.token);
+    await advance(20);
+    expect((await job(child.id)).state).toBe("completed");
+    await stopWorker(worker);
+  });
+
+  it("ignores unblocked jobs in queues it doesn't work on", async () => {
+    const { conveyor, broker, worker, job } = await start({ x: () => "done" }, { pollMs: 10, maxPollMs: 60_000 });
+    const parent = await conveyor.enqueue({ queue: "elsewhere", name: "x" });
+    const child = await conveyor.enqueue({ queue: "not-mine", name: "x", dependsOn: [parent.id] });
+    await advance(200_000, 1000);
+    const lease = await broker.claim(["elsewhere"], "other-worker");
+    await broker.complete(parent.id, lease!.token);
+    await advance(20);
+    expect((await job(child.id)).state).toBe("waiting");
+    await stopWorker(worker);
+  });
+
   it("logs a failed claim and keeps polling", async () => {
     const { conveyor, broker, worker, records, job } = await start({ x: () => "ok" });
     vi.spyOn(broker, "claim").mockRejectedValueOnce(new Error("database is locked"));

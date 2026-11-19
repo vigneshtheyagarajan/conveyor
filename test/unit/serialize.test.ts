@@ -28,6 +28,9 @@ const job: Job = {
   result: null,
   lastError: null,
   uniqueKey: "u",
+  flowId: null,
+  flowKey: null,
+  terminatedBy: null,
   scheduleId: null,
 };
 
@@ -52,7 +55,7 @@ describe("jobView", () => {
       [
         "id", "queue", "name", "state", "payload", "priority", "attempts", "maxAttempts", "progress",
         "result", "lastError", "uniqueKey", "scheduleId", "timeoutMs", "runAt", "createdAt",
-        "startedAt", "finishedAt", "workerId", "leaseExpiresAt",
+        "startedAt", "finishedAt", "workerId", "leaseExpiresAt", "flowId", "flowKey", "terminatedBy",
       ].sort(),
     );
   });

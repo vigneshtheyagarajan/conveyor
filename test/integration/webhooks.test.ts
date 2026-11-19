@@ -84,7 +84,7 @@ describe("managing webhooks", () => {
 
   // Previously accepted, but the dispatcher only sends job lifecycle events, so these
   // subscriptions silently never fired.
-  it.each(["job.claimed", "job.progress", "job.reaped", "queue.paused", "queue.resumed", "schedule.fired"])(
+  it.each(["job.claimed", "job.progress", "job.reaped", "job.unblocked", "queue.paused", "queue.resumed", "schedule.fired"])(
     "rejects a subscription to %s, which is never delivered",
     async (event) => {
       const { d } = await dispatcher();

@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import type { Job } from "./types.js";
+import type { FlowOutcome, Job } from "./types.js";
 
 export interface ConveyorEvents {
   "job.enqueued": [job: Job];
@@ -9,11 +9,22 @@ export interface ConveyorEvents {
   "job.retrying": [job: Job, error: string, delayMs: number];
   "job.dead": [job: Job, error: string];
   "job.cancelled": [job: Job];
+  /**
+   * A blocked job's dependencies have all settled; it is now waiting or delayed, after being
+   * blocked for `blockedMs`. In-process only: not delivered to webhooks.
+   */
+  "job.unblocked": [job: Job, blockedMs: number];
   "job.reaped": [job: Job];
   "job.progress": [job: Job, progress: number];
   "queue.paused": [queue: string];
   "queue.resumed": [queue: string];
   "schedule.fired": [scheduleId: string, jobId: string];
+  /**
+   * A flow's verdict was recorded, in this process. Webhooks for these are delivered from the
+   * database (see WebhookDispatcher), so they are sent whichever process recorded them.
+   */
+  "flow.completed": [outcome: FlowOutcome];
+  "flow.failed": [outcome: FlowOutcome];
 }
 
 export type EventName = keyof ConveyorEvents;
@@ -72,9 +83,12 @@ export const ALL_EVENTS: EventName[] = [
   "job.retrying",
   "job.dead",
   "job.cancelled",
+  "job.unblocked",
   "job.reaped",
   "job.progress",
   "queue.paused",
   "queue.resumed",
   "schedule.fired",
+  "flow.completed",
+  "flow.failed",
 ];

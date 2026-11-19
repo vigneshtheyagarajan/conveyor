@@ -10,6 +10,7 @@ import type { Scheduler } from "../scheduler/scheduler.js";
 import type { WebhookDispatcher } from "../webhooks/dispatcher.js";
 import { Authenticator, tokensExist } from "./auth.js";
 import { registerScheduleRoutes, registerTokenRoutes, registerWebhookRoutes } from "./handlers/admin.js";
+import { registerFlowRoutes } from "./handlers/flows.js";
 import { registerJobRoutes } from "./handlers/jobs.js";
 import { registerQueueRoutes } from "./handlers/queues.js";
 import { registerWorkerRoutes } from "./handlers/workers.js";
@@ -56,6 +57,7 @@ export class ApiServer {
       }));
     }
     registerJobRoutes(this.router, conveyor);
+    registerFlowRoutes(this.router, conveyor);
     registerQueueRoutes(this.router, conveyor);
     registerWorkerRoutes(this.router, opts.broker);
     registerScheduleRoutes(this.router, opts.scheduler);

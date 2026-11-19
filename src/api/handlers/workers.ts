@@ -1,4 +1,5 @@
 import type { Broker } from "../../broker/broker.js";
+import { dependencySummary, isVisibleToDependent } from "../../core/dependencies.js";
 import { ValidationError } from "../../core/errors.js";
 import type { Json } from "../../util/json.js";
 import { asObject, bool, int, str, strArray } from "../../util/validate.js";
@@ -16,9 +17,17 @@ export function registerWorkerRoutes(router: Router, broker: Broker): void {
       const workerId = str(o, "workerId", { required: true, max: 200 })!;
       const lease = await broker.claim(queues, workerId);
       if (!lease) return { status: 204 };
+      // What the job will see of its dependencies, without results: fetch those from
+      // GET /v1/jobs/:id/dependencies.
+      const dependencies = (await broker.conveyor.dependencyResults(lease.job)).filter(isVisibleToDependent).map(dependencySummary);
       return {
         status: 201,
-        body: { job: jobView(lease.job), leaseToken: lease.token, leaseExpiresAt: new Date(lease.expiresAt).toISOString() },
+        body: {
+          job: jobView(lease.job),
+          leaseToken: lease.token,
+          leaseExpiresAt: new Date(lease.expiresAt).toISOString(),
+          dependencies,
+        },
       };
     },
     "workers",

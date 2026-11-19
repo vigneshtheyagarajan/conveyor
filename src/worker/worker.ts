@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { hostname } from "node:os";
 import type { Broker, Lease } from "../broker/broker.js";
+import { dependencyOutput, isVisibleToDependent, type DependencyResult } from "../core/dependencies.js";
 import { LeaseLostError, UnrecoverableError } from "../core/errors.js";
 import type { Logger } from "../core/logger.js";
 import type { Json } from "../util/json.js";
@@ -90,9 +91,12 @@ export class Worker {
   start(): void {
     if (this.state !== "idle") throw new Error(`worker is ${this.state}`);
     this.state = "running";
-    this.unsubscribe = this.broker.conveyor.events.on("job.enqueued", (job) => {
+    const wakeFor = (job: { queue: string }) => {
       if (this.opts.queues.includes(job.queue)) this.wake?.();
-    });
+    };
+    const events = this.broker.conveyor.events;
+    const offs = [events.on("job.enqueued", wakeFor), events.on("job.unblocked", wakeFor)];
+    this.unsubscribe = () => offs.forEach((off) => off());
     for (let i = 0; i < this.opts.concurrency; i++) {
       this.loops.push(this.loop(i));
     }
@@ -191,6 +195,16 @@ export class Worker {
       const handler = this.opts.handlers.get(job.name);
       if (!handler) throw new UnrecoverableError(`no handler registered for "${job.name}"`);
 
+      // Loaded on first use and shared by dependencies() and dependency(). A failed load is
+      // not cached, so a later call tries again.
+      let loaded: Promise<DependencyResult[]> | undefined;
+      const allDependencies = () => {
+        loaded ??= this.broker.conveyor.dependencyResults(job).catch((err: unknown) => {
+          loaded = undefined;
+          throw err;
+        });
+        return loaded;
+      };
       const ctx: JobContext = {
         job,
         signal: controller.signal,
@@ -199,6 +213,8 @@ export class Worker {
         heartbeat: async () => {
           await this.broker.heartbeat(job.id, token);
         },
+        dependencies: async () => (await allDependencies()).filter(isVisibleToDependent),
+        dependency: async <R>(key: string) => dependencyOutput(job.id, await allDependencies(), key) as R,
       };
 
       const run = Promise.resolve().then(() => handler(ctx));

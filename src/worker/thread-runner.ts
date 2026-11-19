@@ -4,14 +4,25 @@ import { resolve } from "node:path";
 import type { JobHandler } from "./handlers.js";
 import type { Json } from "../util/json.js";
 
+export interface ThreadedOptions {
+  /**
+   * Also pass the job's dependencies (what ctx.dependencies() returns) to the function, as its
+   * second argument: `fn(payload, dependencies)`. Without it the function is called with the
+   * payload only, as before.
+   */
+  dependencies?: boolean;
+}
+
 // Wrap a CPU-heavy function so it runs in a worker thread
-export function threaded(modulePath: string, exportName = "default"): JobHandler {
+export function threaded(modulePath: string, exportName = "default", options: ThreadedOptions = {}): JobHandler {
   const moduleUrl = pathToFileURL(resolve(modulePath)).href;
-  return ({ job, signal }) =>
-    new Promise<Json>((resolvePromise, reject) => {
-      const thread = new ThreadWorker(new URL(import.meta.url), {
-        workerData: { moduleUrl, exportName, payload: job.payload },
-      });
+  return async (ctx) => {
+    const { job, signal } = ctx;
+    const workerData = options.dependencies
+      ? { moduleUrl, exportName, payload: job.payload, dependencies: await ctx.dependencies() }
+      : { moduleUrl, exportName, payload: job.payload };
+    return new Promise<Json>((resolvePromise, reject) => {
+      const thread = new ThreadWorker(new URL(import.meta.url), { workerData });
       const onAbort = () => {
         void thread.terminate();
         reject(signal.reason ?? new Error("aborted"));
@@ -31,6 +42,7 @@ export function threaded(modulePath: string, exportName = "default"): JobHandler
         if (code !== 0) reject(new Error(`worker thread exited with code ${code}`));
       });
     });
+  };
 }
 
 const { isMainThread, parentPort, workerData } = await import("node:worker_threads");
@@ -40,7 +52,8 @@ if (!isMainThread && workerData?.moduleUrl && parentPort) {
     const mod = await import(workerData.moduleUrl);
     const fn = mod[workerData.exportName];
     if (typeof fn !== "function") throw new Error(`${workerData.exportName} is not a function`);
-    const value = await fn(workerData.payload);
+    // Only functions that opted in get a second argument.
+    const value = await ("dependencies" in workerData ? fn(workerData.payload, workerData.dependencies) : fn(workerData.payload));
     port.postMessage({ ok: true, value });
   } catch (err) {
     port.postMessage({ ok: false, error: err instanceof Error ? err.message : String(err) });

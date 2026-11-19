@@ -29,6 +29,13 @@ describe("thread-runner inside the thread", () => {
     expect(await runInFakeThread({ moduleUrl: FIXTURE, exportName: "sum", payload: { values: [2, 3] } })).toEqual([{ ok: true, value: 5 }]);
   });
 
+  it("passes dependencies as a second argument only when they were sent", async () => {
+    expect(await runInFakeThread({ moduleUrl: FIXTURE, exportName: "args", payload: 1 })).toEqual([{ ok: true, value: { count: 1, received: [1] } }]);
+    expect(await runInFakeThread({ moduleUrl: FIXTURE, exportName: "args", payload: 1, dependencies: [{ id: "d" }] })).toEqual([
+      { ok: true, value: { count: 2, received: [1, [{ id: "d" }]] } },
+    ]);
+  });
+
   it("posts the error message when the export throws", async () => {
     expect(await runInFakeThread({ moduleUrl: FIXTURE, exportName: "fail", payload: null })).toEqual([{ ok: false, error: "thread boom" }]);
     expect(await runInFakeThread({ moduleUrl: FIXTURE, exportName: "throwString", payload: null })).toEqual([{ ok: false, error: "plain string" }]);

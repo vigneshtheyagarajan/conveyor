@@ -1,4 +1,5 @@
-export { Conveyor, MAX_DELAY_MS, MAX_RUN_AT, type ConveyorOptions } from "./core/conveyor.js";
+export { Conveyor, MAX_DELAY_MS, MAX_DEPENDENCIES, MAX_FLOW_JOBS, MAX_RUN_AT, type ConveyorOptions } from "./core/conveyor.js";
+export { flowStatus, planFlow, type FlowPlan, type PlannedEdge } from "./core/flow.js";
 export { loadConfig, DEFAULT_CONFIG, type ConveyorConfig } from "./core/config.js";
 export * from "./core/errors.js";
 export { EventBus, type ConveyorEvents, type EventName } from "./core/events.js";
@@ -6,11 +7,18 @@ export { createLogger, silentLogger, type Logger, type LogLevel } from "./core/l
 export * from "./core/types.js";
 export { Broker, type Lease, type FailOptions } from "./broker/broker.js";
 export { Maintenance } from "./broker/maintenance.js";
-export type { Store } from "./storage/store.js";
+export type { FlowCancellation, JobTransition, NewFlow, Store, TransitionResult } from "./storage/store.js";
 export { SqliteStore } from "./storage/sqlite-store.js";
 export { Worker, JobTimeoutError, WorkerShutdownError, type WorkerOptions } from "./worker/worker.js";
 export { HandlerRegistry, type JobHandler, type JobContext } from "./worker/handlers.js";
-export { threaded } from "./worker/thread-runner.js";
+export { threaded, type ThreadedOptions } from "./worker/thread-runner.js";
+export {
+  DependencyError,
+  dependencyResult,
+  isVisibleToDependent,
+  type DependencyResult,
+  type DependencySummary,
+} from "./core/dependencies.js";
 export { Scheduler, type ScheduleInput } from "./scheduler/scheduler.js";
 export { parseCron, nextRun, upcomingRuns, CronParseError } from "./scheduler/cron.js";
 export { LocalRateLimiter, type RateLimiter } from "./ratelimit/limiter.js";

@@ -2,7 +2,89 @@
 
 ## Unreleased
 
+New: job dependencies. `enqueue({ ..., dependsOn: [id, { jobId, onFailure }] })` makes a job
+wait for other jobs in the new `blocked` state. When a dependency ends dead or cancelled, the
+edge's policy decides: `fail` (default) cancels the dependent without running it (with
+`terminatedBy` set), `ignore` and `continue` let it run. `retry()` brings back the dependents
+a failure cancelled, and refuses (409, naming it) to retry a job whose dependency retention has
+deleted. Migration 8 adds the `job_dependencies` and `flow_events` tables, the `flow_id`,
+`flow_key` and `terminated_by` columns, and a unique index on `(flow_id, flow_key)`. See the
+README's "Dependencies and flows" and docs/architecture.md.
+
+New: flows. `conveyor.enqueueFlow({ jobs, onFailure })` submits a graph of new jobs that name
+each other by `key` and may depend on existing jobs by id, all or nothing; `getFlow` returns the
+jobs, edges and a derived status (`running`, `completed`, `failed`, `cancelled`); `cancelFlow`
+cancels every unfinished job of a flow. HTTP: `POST /v1/flows`, `GET /v1/flows/:id`,
+`POST /v1/flows/:id/cancel`, `dependsOn` on `POST /v1/jobs` and `/v1/jobs/bulk`, and
+`GET /v1/jobs/:id/dependencies` and `/dependents`. CLI: `enqueue --depends-on ... [--on-failure p]`,
+`flow-submit <file|->`, `flow <id>`, `flow-cancel <id>`. Jobs returned by the API gain `flowId`,
+`flowKey` and `terminatedBy`.
+
+New: dependency results. In-process handlers read their dependencies with `ctx.dependencies()`
+and `ctx.dependency(key)` (loaded lazily, cached per attempt; `dependency` throws a
+`DependencyError` if the dependency didn't complete). Under `ignore` a failed dependency is left
+out of the list; under `continue` it is listed with its state and error. HTTP leases include
+`dependencies` (`{id, key, name, state}`), and `GET /v1/jobs/:id/dependencies` now returns
+results, paged (`cursor`, `limit`, and `all=true` for failed `ignore` dependencies).
+`threaded(path, name, { dependencies: true })` passes them to the thread function as a second
+argument.
+
+New: flow webhooks. `flow.failed` (as soon as a job in the flow is dead or cancelled) and
+`flow.completed` (once every job has completed); one verdict per flow, delivered once, from the
+database, so they are sent whichever process ran the jobs. `GET /v1/flows/:id` shows the
+verdict as `outcome`.
+
+New metrics: `conveyor_job_blocked_seconds`, `conveyor_jobs_cancelled_by_dependency_total` and
+`conveyor_flows_finished_total`; `conveyor_queue_jobs` includes `state="blocked"`.
+
+Retention keeps completed and cancelled jobs while a job that depends on them is unfinished.
+
+`POST /v1/queues/:name/retry-dead` returns `{retried, skipped}`: jobs that can't be retried are
+skipped with the reason instead of stopping the batch (`Conveyor.retryDead`; `retryAllDead`
+still returns the count). `conveyor dlq --retry` lists them.
+
+Known limitations: see docs/architecture.md ("retry the whole flow" is not built).
+
+Breaking changes for `Store` implementations:
+
+- Transitions are guarded and return what they changed: `completeJob(id, leaseToken, result, now)`,
+  `scheduleRetry(id, leaseToken, error, runAt, now)`, `markDead(id, leaseToken, error, now)`,
+  `releaseLease(id, leaseToken, now)`, `cancelJob(id, now)` and the new `retryJob(id, now)` and
+  `requeueExpired(id, leaseToken, now)` return a `TransitionResult` (the job, its previous state,
+  the dependents changed as a consequence and the flow verdicts recorded), or `undefined` without changing anything if the
+  job isn't in the expected state or the lease token doesn't match. Each writes its history
+  entry itself, in the same transaction; callers no longer call `appendJobEvent` for them.
+- `requeueJob` is removed: use `retryJob` (dead/cancelled -> waiting) or `requeueExpired` (the
+  reaper).
+- `insertJobs(jobs, events, dependencies?)` takes dependency edges and returns the jobs it
+  released at once.
+- `deleteFinishedBefore` must keep jobs that an unfinished job depends on.
+- New: `listDependencies(jobId)`, `listDependencyJobs(jobId, { after, limit, visibleOnly })`, `listDependentJobs(jobId, page)`,
+  `reconcileBlocked(now, limit)` (returns `{ jobs, flowOutcomes }`), for flows `insertFlow(flow)`,
+  `cancelFlow(flowId, now)`, `listFlowJobs(flowId)` and `listFlowDependencies(flowId)`, and for
+  verdicts `getFlowOutcome`, `listPendingFlowOutcomes` and `claimFlowOutcome`.
+- Transitions that finish a flow job must record the flow's verdict in the same transaction, at
+  most once per flow. A retry must refuse a job whose dependency no longer exists: edges are
+  kept when their dependency is deleted.
+- `Job` has three new fields: `flowId`, `flowKey` and `terminatedBy`.
+- Every transition must check the dependents it affects in the same transaction as the change
+  (see "Why unblocking can't be missed" in docs/architecture.md).
+
 Behaviour changes:
+
+- New job state `blocked`. It appears in queue counts (`counts.blocked`), the `conveyor_queue_jobs`
+  metric, `GET /v1/jobs?state=blocked`, `conveyor jobs --state blocked` and a new column in
+  `conveyor queues`. A blocked job counts as unfinished for `uniqueKey` and for schedules with
+  `overlap: "skip"`.
+- Completing, failing, cancelling, retrying and releasing a job, and the reaper's requeue, are
+  atomic and can't overwrite each other: of two that race, exactly one changes the job (fixes
+  KB-13). A completion or failure reported for a job that was cancelled or reaped in the meantime
+  gets `LeaseLostError`; a second cancel or retry gets a conflict.
+- A change to a job and its history entry are written together; before, a failed history
+  write could leave the change without its entry.
+- New in-process event `job.unblocked` (with how long the job was blocked; not delivered to
+  webhooks); in-process workers wake up on it. A dependent cancelled because its dependency failed emits `job.cancelled`.
+- `Maintenance` runs a new reconcile sweep (`reconcileIntervalMs`, default 5s).
 
 - Jobs with the same priority now run strictly first-in-first-out, including jobs enqueued in the same millisecond.
 - `enqueueBulk` / `POST /v1/jobs/bulk` is all-or-nothing: if any job is invalid or the insert fails, no job is created.

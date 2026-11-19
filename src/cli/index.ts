@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { realpathSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { Broker } from "../broker/broker.js";
@@ -7,7 +7,7 @@ import { Maintenance } from "../broker/maintenance.js";
 import { loadConfig } from "../core/config.js";
 import { Conveyor } from "../core/conveyor.js";
 import { createLogger } from "../core/logger.js";
-import { JOB_STATES, type JobState, type Scope } from "../core/types.js";
+import { JOB_STATES, type FailurePolicy, type Flow, type FlowRequest, type JobState, type Scope } from "../core/types.js";
 import { createRuntime } from "../runtime.js";
 import { Scheduler } from "../scheduler/scheduler.js";
 import { SqliteStore } from "../storage/sqlite-store.js";
@@ -28,10 +28,16 @@ Server
 
 Jobs
   enqueue <queue> <name> [--payload json] [--delay ms] [--priority n] [--unique key]
+          [--depends-on id,id] [--on-failure fail|ignore|continue]
   jobs [--queue q] [--state s] [--limit n]
   job <id>                              show a job and its history
   cancel <id>
   retry <id>
+
+Flows
+  flow-submit <file.json>               submit a flow ({"jobs": [...]}); - reads stdin
+  flow <id>                             show a flow's status and jobs
+  flow-cancel <id>                      cancel a flow's unfinished jobs
 
 Queues
   queues                                list queues with counts
@@ -77,6 +83,8 @@ async function run(argv: string[]): Promise<number> {
       delay: { type: "string" },
       priority: { type: "string" },
       unique: { type: "string" },
+      "depends-on": { type: "string" },
+      "on-failure": { type: "string" },
       queue: { type: "string" },
       queues: { type: "string" },
       state: { type: "string" },
@@ -165,6 +173,11 @@ async function run(argv: string[]): Promise<number> {
           delayMs: num("delay", { min: 0 }),
           priority: num("priority"),
           uniqueKey: values.unique,
+          dependsOn: values["depends-on"]
+            ?.split(",")
+            .map((id) => id.trim())
+            .filter(Boolean)
+            .map((jobId) => ({ jobId, onFailure: (values["on-failure"] ?? "fail") as FailurePolicy })),
         });
         print(json ? job : `enqueued ${job.id} (${job.state})`, json);
         return 0;
@@ -207,10 +220,38 @@ async function run(argv: string[]): Promise<number> {
         return 0;
       }
 
+      case "flow-submit": {
+        const file = need(args[0], "flow file");
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(file === "-" ? readFileSync(0, "utf8") : readFileSync(file, "utf8"));
+        } catch (err) {
+          throw new UsageError(`could not read flow from ${file}: ${(err as Error).message}`);
+        }
+        const flow = await conveyor.enqueueFlow((Array.isArray(parsed) ? { jobs: parsed } : parsed) as FlowRequest);
+        print(json ? flow : `flow ${flow.id} (${flow.status})\n${flowTable(flow)}`, json);
+        return 0;
+      }
+
+      case "flow": {
+        const flow = await conveyor.getFlow(need(args[0], "flow id"));
+        print(json ? flow : `flow ${flow.id} (${flow.status})\n${flowTable(flow)}`, json);
+        return 0;
+      }
+
+      case "flow-cancel": {
+        const id = need(args[0], "flow id");
+        const before = await conveyor.getFlow(id);
+        const flow = await conveyor.cancelFlow(id);
+        const cancelled = flow.counts.cancelled - before.counts.cancelled;
+        print(json ? flow : `cancelled ${cancelled} job${cancelled === 1 ? "" : "s"}`, json);
+        return 0;
+      }
+
       case "queues": {
         const queues = await conveyor.listQueues();
         const rows = queues.map((q) => ({ name: q.name, paused: q.paused, ...q.counts, concurrency: q.concurrency }));
-        print(json ? queues : table(rows, ["name", "paused", "waiting", "delayed", "active", "completed", "dead", "concurrency"]), json);
+        print(json ? queues : table(rows, ["name", "paused", "blocked", "waiting", "delayed", "active", "completed", "dead", "concurrency"]), json);
         return 0;
       }
 
@@ -240,7 +281,9 @@ async function run(argv: string[]): Promise<number> {
       case "dlq": {
         const queue = need(args[0], "queue");
         if (values.retry) {
-          print(`retried ${await conveyor.retryAllDead(queue)} jobs`, json);
+          const res = await conveyor.retryDead(queue);
+          const lines = [`retried ${res.retried} jobs`, ...res.skipped.map((s) => `skipped ${s.jobId}: ${s.error}`)];
+          print(json ? res : lines.join("\n"), json);
           return 0;
         }
         const page = await conveyor.listJobs({ queue, state: "dead", limit: num("limit", { min: 1 }) ?? 50 });
@@ -302,6 +345,24 @@ async function run(argv: string[]): Promise<number> {
 }
 
 class UsageError extends Error {}
+
+/** A flow's jobs, with dependencies shown by key (or id, for jobs outside the flow). */
+function flowTable(flow: Flow): string {
+  const keyOf = new Map(flow.jobs.map((j) => [j.id, j.flowKey]));
+  const rows = flow.jobs.map((j) => ({
+    key: j.flowKey,
+    id: j.id,
+    queue: j.queue,
+    name: j.name,
+    state: j.state,
+    dependsOn:
+      flow.edges
+        .filter((e) => e.childId === j.id)
+        .map((e) => keyOf.get(e.parentId) ?? e.parentId)
+        .join(",") || null,
+  }));
+  return table(rows, ["key", "id", "queue", "name", "state", "dependsOn"]);
+}
 
 /** Parse an integer option strictly: "abc", "", "1.5" and "1e3" are errors, not NaN or 0. */
 function int(value: string | undefined, flag: string, opts: { min?: number; max?: number } = {}): number | undefined {

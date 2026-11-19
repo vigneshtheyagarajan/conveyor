@@ -2,7 +2,10 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Job } from "../../src/core/types.js";
 import { MIGRATIONS } from "../../src/storage/migrations.js";
+import { Broker } from "../../src/broker/broker.js";
+import { Conveyor } from "../../src/core/conveyor.js";
 import { SqliteStore } from "../../src/storage/sqlite-store.js";
+import { ManualClock } from "../../src/util/clock.js";
 import { tempDir } from "../helpers.js";
 
 const T = Date.UTC(2026, 0, 5, 12, 0, 0);
@@ -73,6 +76,9 @@ const EXPECTED_OLD_JOB: Job = {
   lastError: "first try failed",
   uniqueKey: null,
   scheduleId: null,
+  flowId: null,
+  flowKey: null,
+  terminatedBy: null,
 };
 
 function insertRow(db: DatabaseSync, table: string, row: Record<string, string | number | null>) {
@@ -157,6 +163,10 @@ function seed(db: DatabaseSync, version: number) {
       revoked_at: null,
     });
   }
+  if (version >= 8) {
+    insertRow(db, "jobs", { ...OLD_JOB, id: "job-child", state: "blocked", flow_id: "flow-1", flow_key: "child" });
+    insertRow(db, "job_dependencies", { child_id: "job-child", parent_id: "job-old", on_failure: "continue" });
+  }
 }
 
 /** Check that everything seed(version) wrote reads back correctly through the Store. */
@@ -240,6 +250,10 @@ async function expectSeededData(store: SqliteStore, version: number) {
       revokedAt: null,
     });
   }
+  if (version >= 8) {
+    expect(await store.getJob("job-child")).toMatchObject({ state: "blocked", flowId: "flow-1", flowKey: "child", terminatedBy: null });
+    expect(await store.listDependencies("job-child")).toEqual([{ jobId: "job-old", onFailure: "continue" }]);
+  }
 }
 
 describe("migrations", () => {
@@ -257,7 +271,7 @@ describe("migrations", () => {
   });
 
   it("has one entry per schema version", () => {
-    expect(LATEST).toBe(7);
+    expect(LATEST).toBe(8);
     for (const m of MIGRATIONS) expect(m.trim().length).toBeGreaterThan(0);
   });
 
@@ -318,6 +332,55 @@ describe("migrations", () => {
     store = new SqliteStore(file);
     await store.migrate();
     expect(await store.getJob("job-old")).toMatchObject({ uniqueKey: null, scheduleId: null });
+  });
+
+  describe("7 -> 8 (job dependencies)", () => {
+    async function upgradedFromV7() {
+      const file = tmp.file();
+      const old = createAtVersion(file, 7);
+      seed(old, 7);
+      // A job mid-run and a dead one, as a live v7 database would have.
+      insertRow(old, "jobs", { ...OLD_JOB, id: "job-running", state: "active", worker_id: "w1", lease_token: "tok", lease_expires_at: T + 60_000, attempts: 1 });
+      insertRow(old, "jobs", { ...OLD_JOB, id: "job-dead", state: "dead", finished_at: T - 1, last_error: "gave up" });
+      old.close();
+      store = new SqliteStore(file);
+      expect(await store.migrate()).toBe(8);
+      return store;
+    }
+
+    it("keeps every existing job as it was, with empty flow and dependency fields and no edges", async () => {
+      const s = await upgradedFromV7();
+      const rows = s.db.prepare("SELECT id, state, flow_id, flow_key, terminated_by FROM jobs ORDER BY id").all();
+      expect(rows).toEqual([
+        { id: "job-dead", state: "dead", flow_id: null, flow_key: null, terminated_by: null },
+        { id: "job-done", state: "completed", flow_id: null, flow_key: null, terminated_by: null },
+        { id: "job-old", state: "delayed", flow_id: null, flow_key: null, terminated_by: null },
+        { id: "job-running", state: "active", flow_id: null, flow_key: null, terminated_by: null },
+        { id: "job-scheduled", state: "waiting", flow_id: null, flow_key: null, terminated_by: null },
+        { id: "job-unique", state: "waiting", flow_id: null, flow_key: null, terminated_by: null },
+      ]);
+      expect(s.db.prepare("SELECT COUNT(*) AS n FROM job_dependencies").get()).toEqual({ n: 0 });
+      expect(await s.reconcileBlocked(T, 100)).toEqual({ jobs: [], flowOutcomes: [] });
+      await expectSeededData(s, 7);
+    });
+
+    it("lets new jobs depend on jobs written by the old version, and settles them as those finish", async () => {
+      const s = await upgradedFromV7();
+      const clock = new ManualClock(T);
+      const conveyor = new Conveyor({ store: s, clock });
+      const broker = new Broker(conveyor);
+      const onRunning = await conveyor.enqueue({ queue: "emails", name: "after", dependsOn: ["job-running"] });
+      const onDone = await conveyor.enqueue({ queue: "emails", name: "after", dependsOn: ["job-done"] });
+      expect(onRunning.state).toBe("blocked");
+      expect(onDone.state).toBe("waiting");
+      await expect(conveyor.enqueue({ queue: "emails", name: "after", dependsOn: ["job-dead"] })).rejects.toThrow("dependency job-dead is already dead");
+
+      clock.advance(10);
+      await broker.complete("job-running", "tok", { ok: true });
+      expect(await conveyor.getJob(onRunning.id)).toMatchObject({ state: "waiting", runAt: T + 10 });
+      const retried = await conveyor.retry("job-dead");
+      expect(retried.state).toBe("waiting");
+    });
   });
 
   it("rolls back a migration that fails part-way and leaves the version unchanged", async () => {

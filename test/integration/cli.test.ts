@@ -3,6 +3,7 @@
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { main } from "../../src/cli/index.js";
+import type { Job } from "../../src/core/types.js";
 import { SqliteStore } from "../../src/storage/sqlite-store.js";
 import { tempDir } from "../helpers.js";
 
@@ -158,7 +159,7 @@ describe("migrate", () => {
   it("creates the database", async () => {
     const res = await cli("migrate");
     expect(res).toEqual({ code: 0, stdout: `database ready at ${db}\n`, stderr: "" });
-    expect(await withStore(async (s) => s.db.prepare("PRAGMA user_version").get())).toEqual({ user_version: 7 });
+    expect(await withStore(async (s) => s.db.prepare("PRAGMA user_version").get())).toEqual({ user_version: 8 });
   });
 
   it("uses CONVEYOR_DB when --db is not given", async () => {
@@ -176,7 +177,7 @@ describe("migrate", () => {
     await withStore(async (s) => s.db.exec("PRAGMA user_version = 99"));
     const res = await cli("migrate");
     expect(res.code).toBe(1);
-    expect(res.stderr).toMatch(/^error: database schema version 99 is newer than this version of Conveyor supports \(7\)/);
+    expect(res.stderr).toMatch(/^error: database schema version 99 is newer than this version of Conveyor supports \(8\)/);
   });
 });
 
@@ -236,7 +237,7 @@ describe("jobs, job, cancel, retry", () => {
       expect(res).toEqual({
         code: 1,
         stdout: "",
-        stderr: `error: --state must be one of delayed, waiting, active, completed, dead, cancelled; got "${args[2]}"\nrun \`conveyor --help\` for usage\n`,
+        stderr: `error: --state must be one of blocked, delayed, waiting, active, completed, dead, cancelled; got "${args[2]}"\nrun \`conveyor --help\` for usage\n`,
       });
     }
     expect((await cli("jobs", "--state", "waiting", "--json")).code).toBe(0);
@@ -314,8 +315,8 @@ describe("queues", () => {
     const res = await cli("queues");
     expect(res.code).toBe(0);
     const lines = res.stdout.trimEnd().split("\n");
-    expect(lines[0]).toMatch(/^NAME\s+PAUSED\s+WAITING\s+DELAYED\s+ACTIVE\s+COMPLETED\s+DEAD\s+CONCURRENCY$/);
-    expect(lines[1]).toMatch(/^emails\s+false\s+1\s+0\s+0\s+0\s+0\s+2$/);
+    expect(lines[0]).toMatch(/^NAME\s+PAUSED\s+BLOCKED\s+WAITING\s+DELAYED\s+ACTIVE\s+COMPLETED\s+DEAD\s+CONCURRENCY$/);
+    expect(lines[1]).toMatch(/^emails\s+false\s+0\s+1\s+0\s+0\s+0\s+0\s+2$/);
     expect(JSON.parse((await cli("queues", "--json")).stdout)[0]).toMatchObject({ name: "emails", counts: { waiting: 1 } });
   });
 
@@ -338,6 +339,7 @@ describe("queues", () => {
         id: "dead-1", queue: "q", name: "x", payload: null, state: "dead", priority: 0, attempts: 3, maxAttempts: 3, backoff: null,
         timeoutMs: 0, runAt: 0, createdAt: 0, updatedAt: 0, startedAt: 0, finishedAt: 1, workerId: null, leaseToken: null,
         leaseExpiresAt: null, progress: 0, result: null, lastError: "boom", uniqueKey: null, scheduleId: null,
+        flowId: null, flowKey: null, terminatedBy: null,
       });
     });
     const list = await cli("dlq", "q");
@@ -406,5 +408,112 @@ describe("tokens", () => {
 
   it("rejects an unknown scope", async () => {
     expect(await cli("token-create", "ops", "--scopes", "root")).toMatchObject({ code: 1, stderr: "error: unknown scope root\n" });
+  });
+});
+
+/** A complete job row for the CLI tests to insert directly. */
+function makeCliJob(id: string, state: "completed" | "dead"): Job {
+  return {
+    id, queue: "q", name: "x", payload: null, state, priority: 0, attempts: 1, maxAttempts: 1, backoff: null,
+    timeoutMs: 0, runAt: 0, createdAt: 0, updatedAt: 0, startedAt: 0, finishedAt: 1, workerId: null, leaseToken: null,
+    leaseExpiresAt: null, progress: 0, result: null, lastError: null, uniqueKey: null, scheduleId: null,
+    flowId: null, flowKey: null, terminatedBy: null,
+  };
+}
+
+describe("dependencies and flows", () => {
+  const writeFlow = async (body: unknown, name = "flow.json") => {
+    const path = tmp.file(name);
+    (await import("node:fs")).writeFileSync(path, typeof body === "string" ? body : JSON.stringify(body));
+    return path;
+  };
+
+  it("enqueue --depends-on creates a blocked job, with --on-failure for every dependency", async () => {
+    const parent = JSON.parse((await cli("enqueue", "q", "x", "--json")).stdout);
+    const other = JSON.parse((await cli("enqueue", "q", "x", "--json")).stdout);
+    const res = await cli("enqueue", "q", "child", "--depends-on", `${parent.id}, ${other.id}`, "--on-failure", "continue");
+    expect(res).toMatchObject({ code: 0, stdout: expect.stringMatching(/^enqueued \S+ \(blocked\)\n$/) });
+    const id = res.stdout.split(" ")[1]!;
+    expect(await withStore((s) => s.listDependencies(id))).toEqual(
+      [parent.id, other.id].sort().map((jobId) => ({ jobId, onFailure: "continue" })),
+    );
+  });
+
+  it("enqueue --depends-on rejects unknown jobs and policies, storing nothing", async () => {
+    expect(await cli("enqueue", "q", "x", "--depends-on", "nope")).toMatchObject({ code: 1, stderr: "error: dependency nope not found\n" });
+    expect(await cli("enqueue", "q", "x", "--depends-on", "nope", "--on-failure", "maybe")).toMatchObject({
+      code: 1,
+      stderr: "error: onFailure must be one of fail, ignore, continue\n",
+    });
+    expect(await jobs()).toEqual([]);
+  });
+
+  it("flow-submit submits a flow file and prints its jobs; flow shows it; flow-cancel cancels it", async () => {
+    const file = await writeFlow({ jobs: [{ key: "b", queue: "q", name: "x", dependsOn: ["a"] }, { key: "a", queue: "q", name: "x" }] });
+    const submitted = await cli("flow-submit", file);
+    expect(submitted.code).toBe(0);
+    const [header, columns, first, second] = submitted.stdout.trimEnd().split("\n");
+    const flowId = header!.match(/^flow (\S+) \(running\)$/)![1]!;
+    expect(columns).toMatch(/^KEY\s+ID\s+QUEUE\s+NAME\s+STATE\s+DEPENDSON$/);
+    expect(first).toMatch(/^a\s+\S+\s+q\s+x\s+waiting\s+-$/);
+    expect(second).toMatch(/^b\s+\S+\s+q\s+x\s+blocked\s+a$/);
+
+    expect((await cli("flow", flowId)).stdout).toBe(submitted.stdout);
+    expect(JSON.parse((await cli("flow", flowId, "--json")).stdout)).toMatchObject({ id: flowId, status: "running", counts: { waiting: 1, blocked: 1 } });
+
+    expect(await cli("flow-cancel", flowId)).toMatchObject({ code: 0, stdout: "cancelled 2 jobs\n" });
+    expect(await cli("flow-cancel", flowId)).toMatchObject({ code: 1, stderr: `error: flow ${flowId} has already finished\n` });
+    expect(JSON.parse((await cli("flow", flowId, "--json")).stdout).status).toBe("cancelled");
+  });
+
+  it("flow-submit accepts a bare array of jobs; flow-cancel says 1 job, or prints the flow with --json", async () => {
+    const flow = JSON.parse((await cli("flow-submit", await writeFlow([{ key: "only", queue: "q", name: "x" }]), "--json")).stdout);
+    expect(flow).toMatchObject({ status: "running", jobs: [{ flowKey: "only", state: "waiting" }] });
+    expect((await cli("flow-cancel", flow.id)).stdout).toBe("cancelled 1 job\n");
+    const second = JSON.parse((await cli("flow-submit", await writeFlow([{ key: "only", queue: "q", name: "x" }], "two.json"), "--json")).stdout);
+    expect(JSON.parse((await cli("flow-cancel", second.id, "--json")).stdout)).toMatchObject({ id: second.id, status: "cancelled" });
+  });
+
+  it("shows dependencies on jobs outside the flow by id", async () => {
+    const outside = JSON.parse((await cli("enqueue", "q", "x", "--json")).stdout);
+    const res = await cli("flow-submit", await writeFlow({ jobs: [{ key: "a", queue: "q", name: "x", dependsOn: [{ jobId: outside.id }] }] }));
+    expect(res.stdout.trimEnd().split("\n")[2]).toMatch(new RegExp(`^a\\s+\\S+\\s+q\\s+x\\s+blocked\\s+${outside.id}$`));
+  });
+
+  it.each<[string, () => Promise<string[]>, RegExp]>([
+    ["no file", async () => ["flow-submit"], /^error: flow file is required\n/],
+    ["a missing file", async () => ["flow-submit", tmp.file("missing.json")], /^error: could not read flow from .*missing\.json: ENOENT/],
+    ["invalid JSON", async () => ["flow-submit", await writeFlow("{nope")], /^error: could not read flow from .*flow\.json: /],
+    ["a cycle", async () => ["flow-submit", await writeFlow({ jobs: [{ key: "a", queue: "q", name: "x", dependsOn: ["b"] }, { key: "b", queue: "q", name: "x", dependsOn: ["a"] }] })], /^error: flow has a dependency cycle: a -> b -> a\n$/],
+    ["an unknown flow", async () => ["flow", "nope"], /^error: flow nope not found\n$/],
+    ["no flow id", async () => ["flow"], /^error: flow id is required\n/],
+    ["cancelling an unknown flow", async () => ["flow-cancel", "nope"], /^error: flow nope not found\n$/],
+  ])("exits 1 for %s, storing nothing", async (_label, args, stderr) => {
+    const res = await cli(...(await args()));
+    expect(res.code).toBe(1);
+    expect(res.stderr).toMatch(stderr);
+    expect(await jobs()).toEqual([]);
+  });
+
+  it("retry and dlq --retry refuse a dead job whose dependency was deleted", async () => {
+    const ids = await withStore(async (s) => {
+      const parent = makeCliJob("parent", "completed");
+      const child = makeCliJob("child", "dead");
+      await s.insertJob(parent);
+      await s.insertJobs([child], [], [{ childId: child.id, parentId: parent.id, onFailure: "fail" }]);
+      s.db.prepare("DELETE FROM jobs WHERE id = ?").run(parent.id);
+      return { parent: parent.id, child: child.id };
+    });
+    const message = `job ${ids.child} can't be retried: its dependency ${ids.parent} no longer exists`;
+    expect(await cli("retry", ids.child)).toMatchObject({ code: 1, stderr: `error: ${message}\n` });
+    expect(await cli("dlq", "q", "--retry")).toMatchObject({ code: 0, stdout: `retried 0 jobs\nskipped ${ids.child}: ${message}\n` });
+    expect(JSON.parse((await cli("dlq", "q", "--retry", "--json")).stdout)).toEqual({ retried: 0, skipped: [{ jobId: ids.child, error: message }] });
+  });
+
+  it("the help lists the flow commands and options", async () => {
+    const help = (await cli("--help")).stdout;
+    for (const text of ["flow-submit <file.json>", "flow <id>", "flow-cancel <id>", "--depends-on id,id", "--on-failure fail|ignore|continue"]) {
+      expect(help).toContain(text);
+    }
   });
 });

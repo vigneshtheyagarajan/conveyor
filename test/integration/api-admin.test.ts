@@ -148,7 +148,7 @@ describe("webhooks", () => {
     ["an invalid url", { url: "nope", events: ["*"] }, "url must be a valid URL"],
     ["no events", { url: "https://x.test" }, "events must be a non-empty array"],
     ["non-string events", { url: "https://x.test", events: [1] }, "events must be an array of strings"],
-    ["an event that is never delivered", { url: "https://x.test", events: ["queue.paused"] }, "event queue.paused is not delivered to webhooks; use one of job.enqueued, job.completed, job.failed, job.retrying, job.dead, job.cancelled or *"],
+    ["an event that is never delivered", { url: "https://x.test", events: ["queue.paused"] }, "event queue.paused is not delivered to webhooks; use one of job.enqueued, job.completed, job.failed, job.retrying, job.dead, job.cancelled, flow.completed, flow.failed or *"],
     ["a non-string secret", { url: "https://x.test", events: ["*"], secret: 5 }, "secret must be a string"],
   ])("POST rejects %s with 400", async (_label, body, message) => {
     const res = await api.req("POST", "/v1/webhooks", { body });

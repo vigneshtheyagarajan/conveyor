@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Maintenance } from "../../src/broker/maintenance.js";
+import { ConflictError } from "../../src/core/errors.js";
 import type { Job } from "../../src/core/types.js";
 import { manualClock, memoryLogger, setup } from "../helpers.js";
 
@@ -126,6 +127,124 @@ describe("janitor (retention)", () => {
     await expect(conveyor.getJob(cancelled)).rejects.toThrow("not found");
     expect((await conveyor.getJob(dead)).state).toBe("dead");
     expect(records).toContainEqual(expect.objectContaining({ level: "info", msg: "deleted finished jobs", deleted: 2 }));
+  });
+
+  // A dependent reads its dependencies' results when it runs, so a finished job must stay
+  // while anything that depends on it is unfinished. After that, normal retention applies.
+  it("keeps a finished job while a job that depends on it is unfinished", async () => {
+    const clock = manualClock();
+    const { conveyor, broker } = await setup({ clock, config: { retentionMs: DAY } });
+    const m = new Maintenance(conveyor);
+    const finish = async (queue: string) => {
+      const lease = (await broker.claim([queue], "w"))!;
+      await broker.complete(lease.job.id, lease.token, { from: lease.job.id });
+      return lease.job.id;
+    };
+    const parent = await conveyor.enqueue({ queue: "parents", name: "x" });
+    const slow = await conveyor.enqueue({ queue: "slow", name: "x" });
+    const child = await conveyor.enqueue({ queue: "kids", name: "x", dependsOn: [parent.id, slow.id] });
+    await finish("parents");
+
+    clock.advance(3 * DAY); // the parent is well past retention, but the child is still blocked on `slow`
+    expect(await m.cleanup()).toBe(0);
+    expect((await conveyor.getJob(parent.id)).state).toBe("completed");
+
+    await finish("slow"); // the child is released; `slow` is fresh, the parent still protected
+    expect((await conveyor.getJob(child.id)).state).toBe("waiting");
+    expect(await m.cleanup()).toBe(0);
+    const running = (await broker.claim(["kids"], "w"))!;
+    clock.advance(DAY);
+    expect(await m.cleanup()).toBe(0); // still protected while the child runs
+
+    await broker.complete(running.job.id, running.token);
+    // Every dependent has finished: normal retention applies. The parent finished long ago and
+    // goes now; `slow` (finished a day ago) goes once it is past retention, and the child after
+    // its own retention period.
+    expect(await m.cleanup()).toBe(1);
+    await expect(conveyor.getJob(parent.id)).rejects.toThrow("not found");
+    clock.advance(1);
+    expect(await m.cleanup()).toBe(1);
+    await expect(conveyor.getJob(slow.id)).rejects.toThrow("not found");
+    expect((await conveyor.getJob(child.id)).state).toBe("completed");
+    clock.advance(DAY);
+    expect(await m.cleanup()).toBe(1);
+    await expect(conveyor.getJob(child.id)).rejects.toThrow("not found");
+  });
+
+  it("keeps a cancelled job while a job that depends on it with ignore or continue is unfinished", async () => {
+    const clock = manualClock();
+    const { conveyor } = await setup({ clock, config: { retentionMs: DAY } });
+    const parent = await conveyor.enqueue({ queue: "q", name: "x" });
+    const other = await conveyor.enqueue({ queue: "q", name: "x" });
+    await conveyor.enqueue({ queue: "kids", name: "x", dependsOn: [{ jobId: parent.id, onFailure: "continue" }, other.id] });
+    await conveyor.cancel(parent.id);
+    clock.advance(2 * DAY);
+    expect(await new Maintenance(conveyor).cleanup()).toBe(0);
+    expect((await conveyor.getJob(parent.id)).state).toBe("cancelled");
+  });
+
+  // A finished job keeps nothing alive, so retention may delete its dependencies. A retry must
+  // then refuse, naming the missing job, rather than run without it.
+  it("refuses to retry a dead job whose dependency retention deleted", async () => {
+    const clock = manualClock();
+    const { conveyor, broker } = await setup({ clock, config: { retentionMs: DAY } });
+    const kept = await conveyor.enqueue({ queue: "parents", name: "x" });
+    const parent = await conveyor.enqueue({ queue: "parents", name: "x" });
+    const child = await conveyor.enqueue({ queue: "kids", name: "x", dependsOn: [kept.id, parent.id], maxAttempts: 1 });
+    for (const _ of [kept, parent]) {
+      const p = (await broker.claim(["parents"], "w"))!;
+      await broker.complete(p.job.id, p.token, "result");
+    }
+    const c = (await broker.claim(["kids"], "w"))!;
+    await broker.fail(child.id, c.token, "boom");
+    // `kept` is also needed by a job that is still blocked.
+    await conveyor.enqueue({ queue: "other", name: "x", dependsOn: [kept.id, (await conveyor.enqueue({ queue: "other", name: "x" })).id] });
+
+    clock.advance(2 * DAY);
+    expect(await new Maintenance(conveyor).cleanup()).toBe(1);
+    await expect(conveyor.getJob(parent.id)).rejects.toThrow("not found");
+
+    const before = await conveyor.getJob(child.id);
+    await expect(conveyor.retry(child.id)).rejects.toThrow(
+      new ConflictError(`job ${child.id} can't be retried: its dependency ${parent.id} no longer exists`),
+    );
+    expect(await conveyor.getJob(child.id)).toEqual(before);
+  });
+
+  it("refuses to retry a job cancelled by its dependency once retention deleted that dependency", async () => {
+    const clock = manualClock();
+    const { conveyor } = await setup({ clock, config: { retentionMs: DAY } });
+    const parent = await conveyor.enqueue({ queue: "parents", name: "x" });
+    const child = await conveyor.enqueue({ queue: "kids", name: "x", dependsOn: [parent.id] });
+    await conveyor.cancel(parent.id); // cancels the child too
+    clock.advance(2 * DAY);
+    // Both have finished; delete just the parent, as a cleanup that stops at its batch size would.
+    expect(await new Maintenance(conveyor, { batchSize: 1 }).cleanup()).toBe(1);
+    await expect(conveyor.getJob(parent.id)).rejects.toThrow("not found");
+    await expect(conveyor.retry(child.id)).rejects.toThrow(`its dependency ${parent.id} no longer exists`);
+  });
+
+  it("retryDead skips, with the reason, a dead job whose dependency retention deleted, and retries the rest", async () => {
+    const clock = manualClock();
+    const { conveyor, broker } = await setup({ clock, config: { retentionMs: DAY } });
+    const parent = await conveyor.enqueue({ queue: "parents", name: "x" });
+    const child = await conveyor.enqueue({ queue: "kids", name: "x", dependsOn: [parent.id], maxAttempts: 1 });
+    const plain = await conveyor.enqueue({ queue: "kids", name: "y", maxAttempts: 1 });
+    const p = (await broker.claim(["parents"], "w"))!;
+    await broker.complete(parent.id, p.token);
+    for (let i = 0; i < 2; i++) {
+      const l = (await broker.claim(["kids"], "w"))!;
+      await broker.fail(l.job.id, l.token, "boom");
+    }
+    clock.advance(2 * DAY);
+    await new Maintenance(conveyor).cleanup();
+    expect(await conveyor.retryDead("kids")).toEqual({
+      retried: 1,
+      skipped: [{ jobId: child.id, error: `job ${child.id} can't be retried: its dependency ${parent.id} no longer exists` }],
+    });
+    expect((await conveyor.getJob(plain.id)).state).toBe("waiting");
+    expect((await conveyor.getJob(child.id)).state).toBe("dead");
+    expect(await conveyor.retryAllDead("kids")).toBe(0);
   });
 
   it("keeps unfinished jobs however old they are", async () => {

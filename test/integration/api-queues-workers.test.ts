@@ -34,7 +34,7 @@ describe("queues", () => {
       defaultMaxAttempts: 3,
       createdAt: T,
       updatedAt: T,
-      counts: { delayed: 0, waiting: 1, active: 0, completed: 0, dead: 0, cancelled: 0 },
+      counts: { blocked: 0, delayed: 0, waiting: 1, active: 0, completed: 0, dead: 0, cancelled: 0 },
       oldestWaitingAt: T,
     });
     expect((await api.req("GET", "/v1/queues/never-seen")).body).toMatchObject({ name: "never-seen", counts: { waiting: 0 }, oldestWaitingAt: null });
@@ -88,9 +88,9 @@ describe("queues", () => {
     }
     const res = await api.req("POST", "/v1/queues/q/retry-dead");
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ retried: 2 });
+    expect(res.body).toEqual({ retried: 2, skipped: [] });
     expect((await api.conveyor.queueStats("q")).counts).toMatchObject({ dead: 0, waiting: 2 });
-    expect((await api.req("POST", "/v1/queues/q/retry-dead")).body).toEqual({ retried: 0 });
+    expect((await api.req("POST", "/v1/queues/q/retry-dead")).body).toEqual({ retried: 0, skipped: [] });
   });
 });
 
@@ -111,6 +111,7 @@ describe("worker protocol", () => {
       job: expect.objectContaining({ id: job.id, state: "active", attempts: 1, workerId: "http-1", payload: { n: 1 } }),
       leaseToken: expect.stringMatching(/^[0-9a-f-]{36}$/),
       leaseExpiresAt: new Date(T + 1000).toISOString(),
+      dependencies: [],
     });
     expect(res.body.job).not.toHaveProperty("leaseToken");
   });

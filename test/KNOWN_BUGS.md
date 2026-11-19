@@ -13,9 +13,8 @@ IDs are never reused. Fixed bugs are removed from this file (their tests stay, m
 | KB-1 | Reaper | Expired leases are requeued without checking `maxAttempts`, so a job that crashes its worker retries forever | concurrency work | `test/integration/maintenance.test.ts` |
 | KB-2 | API auth | Revoking every token turns authentication off | security work | `test/unit/auth.test.ts` |
 | KB-9 | Webhooks | `verify()` compares signatures with `===`, not in constant time | security work | none (see below) |
-| KB-11 | Store/broker | Two concurrent claims can both lease the same job: `activateJob` has no `state = 'waiting'` guard | concurrency work | `test/integration/store-contract.ts` |
+| KB-11 | Store/broker | Two concurrent claims can both lease the same job: `activateJob` has no `state = 'waiting'` guard. It can even reopen a job that already completed | concurrency work | `test/integration/store-contract.ts`, `test/integration/large-scale.test.ts` |
 | KB-12 | Broker | A queue's `concurrency` limit is exceeded by parallel claims (count, then activate) | concurrency work | `test/integration/broker.test.ts` |
-| KB-13 | Store | `cancelJob` (and the reaper's `requeueJob`) update by id only, so they can overwrite a job that finished in between | concurrency work | `test/integration/store-contract.ts` |
 | KB-14 | Store | Nothing in the database enforces `uniqueKey`, so concurrent enqueues can both insert | concurrency work | `test/integration/store-contract.ts` |
 | KB-16 | Migrations | Suspected: two processes migrating a fresh database at the same time can fail | concurrency work | none (see below) |
 | KB-17 | Broker | A rate-limited queue blocks every other queue in the same claim | concurrency work | `test/integration/broker.test.ts` |
@@ -24,9 +23,13 @@ IDs are never reused. Fixed bugs are removed from this file (their tests stay, m
 
 ## Details
 
-**KB-1. Reaper ignores `maxAttempts`.** `Maintenance.reap()` calls `requeueJob(id, now, false)`
+**KB-1. Reaper ignores `maxAttempts`.** `Maintenance.reap()` calls `requeueExpired(id, leaseToken, now)`
 for every expired lease. The intended behaviour is that a job with no attempts left goes to
 `dead`. The test shows a job with `maxAttempts: 2` still `waiting` after two expired leases.
+When fixing it, move the job to dead with `store.markDead(id, job.leaseToken, ...)`: it is the
+one path to dead, and it settles the job's dependents (cancels the ones with the `fail` policy)
+in the same transaction. Until then, dependents of a job that keeps crashing its worker stay
+blocked.
 
 **KB-2. Auth switches off after every token is revoked.** `tokensExist()` only enforces auth
 while an unrevoked token exists. The server process remembers a positive answer, but after a
@@ -37,9 +40,25 @@ after a leak, leaves every endpoint open, including `POST /v1/tokens`.
 on equal-length buffers. Not unit-tested: a timing difference isn't something a unit test can
 reliably observe.
 
-**KB-11, KB-12, KB-13, KB-14. Races between claims, cancels, the reaper and enqueues.** The
-store's updates are unconditional (`WHERE id = ?`), and the broker and Conveyor check state in
-one call and write in another. The tests state the guard each operation needs.
+**KB-11 in practice.** The fan-out tests in `large-scale.test.ts` show how far this goes.
+When many jobs become ready at once (a fan-out releasing 1000 children, or a queue with a backlog
+when a worker starts), the loops of one worker with `concurrency: 8` claim in lockstep: in that
+test every child's handler runs once per loop, 8 times (the `it.fails` test tagged [KB-11]). The
+same happens in the code from before dependencies: 200 queued jobs and a worker started with
+`concurrency: 8` ran 42 of them more than once, one of them 8 times. Across worker processes it
+is rarer (a few dozen extra runs per 1000 jobs on 4 processes, in our runs), but there `activateJob` can also
+reopen a job that another process has already completed: a process that read it as a candidate
+before the other claimed it sets it back to `active`, runs it again and completes it a second
+time. Completions are guarded (KB-13 was fixed), so a job is never completed on a stale lease,
+and dependents are still released exactly once, after every dependency first completed. But
+handlers run more than once, so a fix needs both the `state = 'waiting'` guard and a claim that
+is atomic (claim the candidate in the same statement that selects it, or retry on a lost race).
+
+**KB-11, KB-12, KB-14. Races between claims and enqueues.** `activateJob` updates
+unconditionally (`WHERE id = ?`), `claim()` counts active jobs and activates in separate calls,
+and the unique-key check runs before the insert's transaction. The tests state the guard each
+operation needs. (Completing, failing, cancelling, retrying, releasing and the reaper's requeue
+are guarded and transactional since KB-13 was fixed; claiming is left to the concurrency work.)
 
 **KB-16. Concurrent first-time migration (suspected, not reproduced).** `migrate()` reads
 `user_version` outside the transaction and uses a deferred `BEGIN`. If `serve` and a `worker`
@@ -82,7 +101,10 @@ This needs a cross-process event path, which is a design change rather than a te
    and HTTP workers) and recommend HTTP workers when webhooks matter.
 
 Option 1 or 2 matches the existing architecture (SQLite as the shared medium between
-processes) best. Metrics have the same limitation: counters only see events in their own process.
+processes) best. Flow verdicts (`flow.completed`, `flow.failed`) already work like option 2:
+they are recorded in `flow_events` in the transition's transaction and delivered from there by
+any dispatcher (see "Flow verdicts and webhooks" in docs/architecture.md), so they are not
+affected by this bug. Metrics have the same limitation: counters only see events in their own process.
 
 **KB-24. First token through the API.** `tokensExist()` caches "no tokens" for 2 seconds, and
 `POST /v1/tokens` doesn't clear that cache. So for up to 2 seconds after the first token is

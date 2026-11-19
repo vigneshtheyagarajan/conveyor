@@ -1,0 +1,8 @@
+{
+  "jobs": [
+    { "key": "fetch", "queue": "default", "name": "fetch-image", "payload": { "url": "https://example.com/cat.jpg" } },
+    { "key": "thumb", "queue": "default", "name": "resize", "payload": { "width": 128 }, "dependsOn": ["fetch"] },
+    { "key": "preview", "queue": "default", "name": "resize", "payload": { "width": 1024 }, "dependsOn": ["fetch"] },
+    { "key": "publish", "queue": "default", "name": "publish", "dependsOn": ["thumb", { "key": "preview", "onFailure": "continue" }] }
+  ]
+}

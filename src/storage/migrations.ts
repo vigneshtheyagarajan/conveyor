@@ -118,4 +118,38 @@ export const MIGRATIONS: string[] = [
   `
   CREATE INDEX idx_deliveries_pending ON webhook_deliveries (status, next_attempt_at);
   `,
+  // 8 - job dependencies and flows
+  // Edges never change once written: whether a child can run is worked out from its parents'
+  // states each time, so there is no counter to drift. terminated_by marks jobs cancelled
+  // because a dependency failed, so retrying that dependency can bring them back.
+  // parent_id has no foreign key: an edge outlives its parent (which retention may delete once
+  // the child has finished) so that the child can never be retried without it. Edges go with
+  // their child. Parents are checked to exist when the edge is inserted.
+  `
+  ALTER TABLE jobs ADD COLUMN flow_id TEXT;
+  ALTER TABLE jobs ADD COLUMN flow_key TEXT;
+  ALTER TABLE jobs ADD COLUMN terminated_by TEXT;
+  CREATE UNIQUE INDEX idx_jobs_flow ON jobs (flow_id, flow_key) WHERE flow_id IS NOT NULL;
+  CREATE INDEX idx_jobs_terminated_by ON jobs (terminated_by) WHERE terminated_by IS NOT NULL;
+  CREATE TABLE job_dependencies (
+    child_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    parent_id TEXT NOT NULL,
+    on_failure TEXT NOT NULL DEFAULT 'fail' CHECK (on_failure IN ('fail', 'ignore', 'continue')),
+    PRIMARY KEY (child_id, parent_id),
+    CHECK (child_id <> parent_id)
+  ) WITHOUT ROWID;
+  CREATE INDEX idx_job_deps_parent ON job_dependencies (parent_id, child_id);
+  -- A flow's verdict, recorded once by the transition that decides it (the primary key makes a
+  -- second one impossible), and the outbox webhooks are delivered from: dispatched_at is set
+  -- by the one dispatcher that claims it.
+  CREATE TABLE flow_events (
+    flow_id TEXT PRIMARY KEY,
+    event TEXT NOT NULL CHECK (event IN ('flow.completed', 'flow.failed')),
+    reason TEXT CHECK (reason IN ('dead', 'cancelled')),
+    job_id TEXT,
+    at INTEGER NOT NULL,
+    dispatched_at INTEGER
+  );
+  CREATE INDEX idx_flow_events_pending ON flow_events (at) WHERE dispatched_at IS NULL;
+  `,
 ];
