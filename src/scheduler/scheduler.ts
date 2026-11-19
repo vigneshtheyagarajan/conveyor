@@ -3,6 +3,7 @@ import type { Conveyor } from "../core/conveyor.js";
 import { ConflictError, NotFoundError, ValidationError } from "../core/errors.js";
 import type { Logger } from "../core/logger.js";
 import type { OverlapPolicy, Schedule } from "../core/types.js";
+import type { SchedulePatch } from "../storage/store.js";
 import type { Json } from "../util/json.js";
 import { NAME_PATTERN } from "../util/validate.js";
 import { isValidTimezone, nextRun, parseCron, upcomingRuns } from "./cron.js";
@@ -66,35 +67,43 @@ export class Scheduler {
     return fired;
   }
 
+  /**
+   * Fire the schedule's due slot. Whether the slot is still due (and not fired by another
+   * scheduler, e.g. a second `serve`), the overlap check, the enqueue and the move to the next
+   * slot are one atomic store step (`fireSchedule`). Only the timing columns are written, so an
+   * edit made while the tick runs is kept.
+   */
   private async fire(schedule: Schedule): Promise<string | null> {
     const now = this.conveyor.clock.now();
-    let jobId: string | null = null;
-
-    if (schedule.overlap === "skip" && (await this.store.hasUnfinishedForSchedule(schedule.id))) {
-      this.logger.info("skipping run; previous run still in progress", { schedule: schedule.name });
-    } else {
-      const job = await this.conveyor.enqueue({
-        queue: schedule.queue,
-        name: schedule.jobName,
-        payload: schedule.payload,
-        scheduleId: schedule.id,
-      });
-      jobId = job.id;
-      this.conveyor.events.emit("schedule.fired", schedule.id, job.id);
-    }
-
-    const updated: Schedule = {
-      ...schedule,
-      lastRunAt: schedule.nextRunAt,
-      lastJobId: jobId ?? schedule.lastJobId,
+    const job = await this.conveyor.buildJob({
+      queue: schedule.queue,
+      name: schedule.jobName,
+      payload: schedule.payload,
+      scheduleId: schedule.id,
+    });
+    const outcome = await this.store.fireSchedule({
+      scheduleId: schedule.id,
+      slot: schedule.nextRunAt,
+      cron: schedule.cron,
+      timezone: schedule.timezone,
       // The next slot after *now*, not after the slot that just fired: after downtime the
       // schedule runs once and continues from the next future slot instead of once per
       // missed slot.
       nextRunAt: nextRun(schedule.cron, Math.max(now, schedule.nextRunAt), schedule.timezone),
-      updatedAt: now,
-    };
-    await this.store.updateSchedule(updated);
-    return jobId;
+      now,
+      job,
+    });
+    if (outcome === "stale") {
+      this.logger.debug("slot already fired or schedule changed; not firing", { schedule: schedule.name });
+      return null;
+    }
+    if (outcome === "skipped") {
+      this.logger.info("skipping run; previous run still in progress", { schedule: schedule.name });
+      return null;
+    }
+    this.conveyor.announceEnqueued(job);
+    this.conveyor.events.emit("schedule.fired", schedule.id, job.id);
+    return job.id;
   }
 
   async create(input: ScheduleInput): Promise<Schedule> {
@@ -124,6 +133,11 @@ export class Scheduler {
     return schedule;
   }
 
+  /**
+   * Change a schedule. Only the fields given in `patch` are written (and next_run_at when the
+   * timing changes), so an edit never puts back values a concurrent tick or edit has changed,
+   * such as the next slot after one that just fired.
+   */
   async update(id: string, patch: Partial<ScheduleInput>): Promise<Schedule> {
     const current = await this.get(id);
     const merged = {
@@ -143,14 +157,13 @@ export class Scheduler {
     const now = this.conveyor.clock.now();
     const timingChanged =
       merged.cron !== current.cron || merged.timezone !== current.timezone || (merged.enabled && !current.enabled);
-    const next: Schedule = {
-      ...current,
-      ...merged,
-      nextRunAt: timingChanged ? nextRun(merged.cron, now, merged.timezone) : current.nextRunAt,
-      updatedAt: now,
-    };
-    await this.store.updateSchedule(next);
-    return next;
+    const changes: SchedulePatch = { updatedAt: now };
+    for (const key of Object.keys(merged) as (keyof typeof merged)[]) {
+      if (patch[key] !== undefined) Object.assign(changes, { [key]: merged[key] });
+    }
+    if (timingChanged) changes.nextRunAt = nextRun(merged.cron, now, merged.timezone);
+    if (!(await this.store.updateSchedule(id, changes))) throw new NotFoundError(`schedule ${id} not found`);
+    return this.get(id);
   }
 
   async get(id: string): Promise<Schedule> {

@@ -9,7 +9,7 @@ TypeScript and backed by SQLite.
 - **Leases and heartbeats**: crashed workers' jobs are picked up again automatically.
 - **Recurring jobs**: cron expressions with IANA timezones and an overlap policy.
 - **Unique jobs**: `uniqueKey` stops the same job being queued twice.
-- **Queue controls**: pause and resume, global concurrency limits, token-bucket rate limits.
+- **Queue controls**: pause and resume, global concurrency limits, token-bucket rate limits (per process, see below).
 - **Webhooks**: job lifecycle events, signed with HMAC-SHA256, with delivery history.
 - **HTTP API** with scoped API tokens, including a worker protocol so workers can be written in any language.
 - **Prometheus metrics**, structured JSON logs, and a `conveyor` command-line tool.
@@ -58,18 +58,26 @@ worker.start();
 await conveyor.enqueue({ queue: "email", name: "send-email", payload: { to: "a@example.com" }, maxAttempts: 5 });
 ```
 
-Handlers receive an `AbortSignal` that fires on timeout or a forced shutdown.
-Throw `UnrecoverableError` to fail a job without retrying it. CPU-heavy work can
-run in a worker thread with `threaded("./path/to/module.js", "exportName")`.
+Handlers receive an `AbortSignal` that fires on timeout, when the job's lease is lost (it was
+cancelled, or reaped), or when `stop()` runs out of patience; honour it. Throw
+`UnrecoverableError` to fail a job without retrying it. See
+[Handlers and their signal](docs/architecture.md#handlers-and-their-signal) for what happens to
+a handler that ignores it.
+
+CPU-heavy synchronous work must run in a worker thread, with
+`threaded("./path/to/module.js", "exportName")`. A handler that blocks the event loop also
+blocks the worker's heartbeats: once its lease expires, the job counts as failed and runs
+again, possibly elsewhere while the first run is still going (at-least-once). A threaded
+handler keeps the event loop free, and its thread is terminated when the signal aborts.
 
 ## Concepts
 
 | Term | Meaning |
 | --- | --- |
-| Queue | A named stream of jobs. Created on first use; settings via `PUT /v1/queues/:name`. |
+| Queue | A named stream of jobs. Created on first use; settings via `PUT /v1/queues/:name`. A queue's `concurrency` limit holds across all processes sharing the database. Its rate limit (`rateLimitMax` per `rateLimitIntervalMs`) is enforced **per process**: each `serve` and `worker` process has its own token bucket, so N processes can together claim up to N times the configured rate. |
 | Job | `{queue, name, payload}` plus options. `name` selects the handler. |
 | Lease | Time-limited claim on a job by one worker, extended by heartbeats. |
-| Reaper | Requeues jobs whose lease expired (crashed or stalled worker). |
+| Reaper | Ends leases that expired (crashed or stalled worker). This counts as a failed attempt: the job is retried after its backoff, or goes to dead once it has no attempts left. Safe to run in any number of processes. |
 | Schedule | A cron expression that enqueues a job each time it fires. |
 
 Delivery is **at-least-once**. Write idempotent handlers. See [docs/architecture.md](docs/architecture.md).
@@ -82,8 +90,8 @@ Delivery is **at-least-once**. Write idempotent handlers. See [docs/architecture
 | `delayMs` / `runAt` | now | Earliest run time. `delayMs` is at most 100 years; `runAt` must be between 1970-01-01 and 9999-12-31T23:59:59.999Z |
 | `maxAttempts` | queue default (3) | Including the first attempt |
 | `backoff` | exponential 1s → 10m, jitter | `{type: "fixed"|"linear"|"exponential", ...}`; each delay setting is at most 100 years |
-| `timeoutMs` | `0` (none) | Per-attempt limit; the handler's signal aborts |
-| `uniqueKey` | – | Return the existing job while one with this key is unfinished |
+| `timeoutMs` | `0` (none) | Per-attempt limit. The handler's signal aborts; the failure is recorded, and the retry can start, only once the handler has stopped |
+| `uniqueKey` | – | Return the existing job while one with this key is unfinished (in the same queue; enforced by the database, across processes). A dead or cancelled job can't be retried while a newer job holds its key |
 
 ## HTTP API
 

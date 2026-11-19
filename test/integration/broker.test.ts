@@ -463,9 +463,9 @@ describe("queue controls", () => {
     expect(await broker.claim(["q"], "w")).toBeDefined();
   });
 
-  // BUG(KB-12): claim() counts active jobs and activates in separate steps, so parallel claims
-  // all see room under the limit.
-  it.fails("respects the concurrency limit under parallel claims [KB-12]", async () => {
+  // Regression (was KB-12): claim() counted active jobs and activated in separate steps, so
+  // parallel claims all saw room under the limit. Across processes: claim-race.test.ts.
+  it("respects the concurrency limit under parallel claims", async () => {
     const { conveyor, broker } = await setup({ clock: manualClock() });
     await conveyor.updateQueue("q", { concurrency: 1 });
     for (let i = 0; i < 5; i++) await conveyor.enqueue({ queue: "q", name: "x" });
@@ -487,10 +487,10 @@ describe("queue controls", () => {
     expect(await broker.claim(["q"], "w")).toBeUndefined();
   });
 
-  // BUG(KB-17): claim() picks the best job across all queues first and only then checks that
-  // queue's rate limit. If that queue is out of tokens the claim returns nothing, even when
-  // another queue in the same claim has jobs ready.
-  it.fails("does not let a rate-limited queue block the other queues in the same claim [KB-17]", async () => {
+  // Regression (was KB-17): claim() picked the best job across all queues first and only then
+  // checked that queue's rate limit. If that queue was out of tokens the claim returned nothing,
+  // even when another queue in the same claim had jobs ready.
+  it("does not let a rate-limited queue block the other queues in the same claim", async () => {
     const { conveyor, broker } = await setup({ clock: manualClock() });
     await conveyor.updateQueue("a", { rateLimitMax: 1, rateLimitIntervalMs: 60_000 });
     await conveyor.enqueue({ queue: "a", name: "x", priority: 10 });
@@ -498,5 +498,42 @@ describe("queue controls", () => {
     const b = await conveyor.enqueue({ queue: "b", name: "x" });
     expect((await broker.claim(["a", "b"], "w"))?.job.queue).toBe("a");
     expect((await broker.claim(["a", "b"], "w"))?.job.id).toBe(b.id);
+  });
+
+  // claim() reserves a token in each rate-limited queue before it claims; it must give back
+  // every token that did not pay for the job it returns.
+  it("gives the token back when a rate-limited queue supplied no job", async () => {
+    const { conveyor, broker } = await setup({ clock: manualClock() });
+    await conveyor.updateQueue("a", { rateLimitMax: 1, rateLimitIntervalMs: 60_000 });
+    expect(await broker.claim(["a"], "w")).toBeUndefined(); // empty queue
+    const b = await conveyor.enqueue({ queue: "b", name: "x", priority: 10 });
+    const a = await conveyor.enqueue({ queue: "a", name: "x" });
+    expect((await broker.claim(["a", "b"], "w"))?.job.id).toBe(b.id); // b wins on priority
+    await conveyor.pause("a");
+    expect(await broker.claim(["a"], "w")).toBeUndefined(); // paused
+    await conveyor.resume("a");
+    // All three claims above left a's single token in place.
+    expect((await broker.claim(["a"], "w"))?.job.id).toBe(a.id);
+    await conveyor.enqueue({ queue: "a", name: "x" });
+    expect(await broker.claim(["a"], "w")).toBeUndefined();
+  });
+
+  it("keeps a rate limit under parallel claims in one process", async () => {
+    const { conveyor, broker } = await setup({ clock: manualClock() });
+    await conveyor.updateQueue("q", { rateLimitMax: 2, rateLimitIntervalMs: 60_000 });
+    for (let i = 0; i < 5; i++) await conveyor.enqueue({ queue: "q", name: "x" });
+    const leases = await Promise.all([1, 2, 3, 4, 5].map((i) => broker.claim(["q"], `w${i}`)));
+    expect(leases.filter(Boolean)).toHaveLength(2);
+  });
+
+  it("gives reserved tokens back when the claim fails", async () => {
+    const { conveyor, broker } = await setup({ clock: manualClock() });
+    await conveyor.updateQueue("q", { rateLimitMax: 1, rateLimitIntervalMs: 60_000 });
+    const j = await conveyor.enqueue({ queue: "q", name: "x" });
+    const claimNext = conveyor.store.claimNext.bind(conveyor.store);
+    conveyor.store.claimNext = () => Promise.reject(new Error("database is locked"));
+    await expect(broker.claim(["q"], "w")).rejects.toThrow("database is locked");
+    conveyor.store.claimNext = claimNext;
+    expect((await broker.claim(["q"], "w"))?.job.id).toBe(j.id);
   });
 });

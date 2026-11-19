@@ -1,6 +1,6 @@
 import { assertDelay, type Conveyor } from "../core/conveyor.js";
 import { LeaseLostError, NotFoundError, UnrecoverableError, ValidationError } from "../core/errors.js";
-import type { Job, QueueSettings } from "../core/types.js";
+import type { Job } from "../core/types.js";
 import { LocalRateLimiter, type RateLimiter } from "../ratelimit/limiter.js";
 import { backoffDelay, DEFAULT_BACKOFF } from "../util/backoff.js";
 import { leaseToken } from "../util/ids.js";
@@ -48,38 +48,46 @@ export class Broker {
     return this.conveyor.clock;
   }
 
+  /**
+   * Lease the next job from `queues` to a worker. Which job, and whether a queue is paused or
+   * at its concurrency limit, is decided by the store in one atomic step, so this is safe with
+   * any number of concurrent claims in this process and in other processes.
+   *
+   * Rate limits are per process (see LocalRateLimiter). A token is reserved in every rate-limited
+   * queue before the claim and queues without one are left out, so a queue that is out of tokens
+   * doesn't block the others. Tokens of queues that did not supply the job are given back.
+   */
   async claim(queues: string[], workerId: string): Promise<Lease | undefined> {
     const now = this.clock.now();
-    const settings = new Map<string, QueueSettings>();
-    const exclude: string[] = [];
-    for (const name of queues) {
-      const q = await this.conveyor.queueSettings(name);
-      settings.set(name, q);
-      if (q.paused) {
-        exclude.push(name);
-        continue;
-      }
-      if (q.concurrency > 0 && (await this.store.countActive(name)) >= q.concurrency) {
-        exclude.push(name);
-      }
-    }
-
-    const candidate = await this.store.findClaimCandidate({ queues, now, exclude });
-    if (!candidate) return undefined;
-
-    const q = settings.get(candidate.queue)!;
-    if (!(await this.rateLimiter.acquire(q))) return undefined;
-
+    const names = [...new Set(queues)];
     const token = leaseToken();
     const expiresAt = now + this.leaseMs;
-    await this.store.activateJob(candidate.id, { workerId, leaseToken: token, leaseExpiresAt: expiresAt, now });
-    await this.store.appendJobEvent(candidate.id, "claimed", { workerId, attempt: candidate.attempts + 1 }, now);
-
-    const job = (await this.store.getJob(candidate.id))!;
+    const reserved: string[] = [];
+    const exclude: string[] = [];
+    let job: Job | undefined;
+    try {
+      for (const name of names) {
+        // Take the token as soon as the settings are read, so parallel claims in this process
+        // can't both count on the last one.
+        if (await this.rateLimiter.acquire(await this.conveyor.queueSettings(name))) reserved.push(name);
+        else exclude.push(name);
+      }
+      if (exclude.length === names.length) return undefined;
+      job = await this.store.claimNext({ queues: names, workerId, leaseToken: token, leaseExpiresAt: expiresAt, now, exclude });
+    } finally {
+      for (const name of reserved) if (name !== job?.queue) await this.rateLimiter.release(name);
+    }
+    if (!job) return undefined;
     this.conveyor.events.emit("job.claimed", job, workerId);
     return { job, token, expiresAt };
   }
 
+  /**
+   * Read the job and check the caller holds its lease. This gives a NotFoundError for an unknown
+   * job and the job's current data, but it is not what protects the job: another process can
+   * take the lease right after this read. Every write that follows is conditional on the lease
+   * token, and `held()` turns a write that changed nothing into a LeaseLostError.
+   */
   private async owned(jobId: string, token: string): Promise<Job> {
     const job = await this.store.getJob(jobId);
     if (!job) throw new NotFoundError(`job ${jobId} not found`);
@@ -87,12 +95,16 @@ export class Broker {
     return job;
   }
 
+  private held(jobId: string, written: boolean): void {
+    if (!written) throw new LeaseLostError(jobId);
+  }
+
   /** Extend the lease. Returns the new expiry. */
   async heartbeat(jobId: string, token: string): Promise<number> {
     await this.owned(jobId, token);
     const now = this.clock.now();
     const expiresAt = now + this.leaseMs;
-    await this.store.extendLease(jobId, expiresAt, now);
+    this.held(jobId, await this.store.extendLease(jobId, token, expiresAt, now));
     return expiresAt;
   }
 
@@ -102,14 +114,14 @@ export class Broker {
     }
     const job = await this.owned(jobId, token);
     const clamped = Math.max(0, Math.min(1, progress));
-    await this.store.updateProgress(jobId, clamped, this.clock.now());
+    this.held(jobId, await this.store.updateProgress(jobId, token, clamped, this.clock.now()));
     this.conveyor.events.emit("job.progress", { ...job, progress: clamped }, clamped);
   }
 
   async complete(jobId: string, token: string, result: Json | null = null): Promise<Job> {
     await this.owned(jobId, token);
     const now = this.clock.now();
-    await this.store.completeJob(jobId, result, now);
+    this.held(jobId, await this.store.completeJob(jobId, token, result, now));
     await this.store.appendJobEvent(jobId, "completed", null, now);
     const job = (await this.store.getJob(jobId))!;
     this.conveyor.events.emit("job.completed", job);
@@ -124,7 +136,7 @@ export class Broker {
     const unrecoverable = opts.unrecoverable || error instanceof UnrecoverableError;
 
     if (unrecoverable || job.attempts >= job.maxAttempts) {
-      await this.store.markDead(jobId, message, now);
+      this.held(jobId, await this.store.markDead(jobId, token, message, now));
       await this.store.appendJobEvent(jobId, "dead", { error: message, attempts: job.attempts }, now);
       const dead = (await this.store.getJob(jobId))!;
       this.conveyor.events.emit("job.failed", dead, message);
@@ -133,7 +145,7 @@ export class Broker {
     }
 
     const delay = opts.retryInMs ?? backoffDelay(job.backoff ?? DEFAULT_BACKOFF, job.attempts, this.random);
-    await this.store.scheduleRetry(jobId, message, now + delay, now);
+    this.held(jobId, await this.store.scheduleRetry(jobId, token, message, now + delay, now));
     await this.store.appendJobEvent(jobId, "retry_scheduled", { error: message, delayMs: delay }, now);
     const retrying = (await this.store.getJob(jobId))!;
     this.conveyor.events.emit("job.failed", retrying, message);
@@ -145,7 +157,7 @@ export class Broker {
   async release(jobId: string, token: string): Promise<void> {
     await this.owned(jobId, token);
     const now = this.clock.now();
-    await this.store.releaseLease(jobId, now);
+    this.held(jobId, await this.store.releaseLease(jobId, token, now));
     await this.store.appendJobEvent(jobId, "released", null, now);
   }
 }

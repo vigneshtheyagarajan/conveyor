@@ -16,11 +16,26 @@ import type {
 import type { BackoffStrategy } from "../util/backoff.js";
 import { safeParse, type Json } from "../util/json.js";
 import { MIGRATIONS } from "./migrations.js";
-import { emptyCounts, type ActivateParams, type ClaimCandidateQuery, type NewJobEvent, type Store } from "./store.js";
+import {
+  emptyCounts,
+  type ClaimParams,
+  type ExpireLeaseParams,
+  type FireOutcome,
+  type FireScheduleParams,
+  type NewJobEvent,
+  type SchedulePatch,
+  type StateChange,
+  type Store,
+} from "./store.js";
 
 type Row = Record<string, SQLInputValue>;
 
 const MAX_PAGE = 500;
+const SQLITE_BUSY = 5;
+
+/** States in which a job holds its unique key (the partial unique index of migration 8). */
+const UNFINISHED = "('delayed', 'waiting', 'active')";
+const isUnfinished = (state: JobState) => state === "delayed" || state === "waiting" || state === "active";
 
 export interface SqliteStoreOptions {
   /** Busy timeout for concurrent writers (other processes). */
@@ -32,11 +47,37 @@ export class SqliteStore implements Store {
   private statements = new Map<string, StatementSync>();
 
   constructor(path = ":memory:", options: SqliteStoreOptions = {}) {
+    const busyTimeoutMs = options.busyTimeoutMs ?? 5000;
     this.db = new DatabaseSync(path);
-    this.db.exec(`PRAGMA busy_timeout = ${options.busyTimeoutMs ?? 5000}`);
-    if (path !== ":memory:") this.db.exec("PRAGMA journal_mode = WAL");
-    this.db.exec("PRAGMA foreign_keys = ON");
-    this.db.exec("PRAGMA synchronous = NORMAL");
+    try {
+      this.db.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
+      if (path !== ":memory:") this.retryWhileBusy(() => this.db.exec("PRAGMA journal_mode = WAL"), busyTimeoutMs);
+      this.db.exec("PRAGMA foreign_keys = ON");
+      this.db.exec("PRAGMA synchronous = NORMAL");
+    } catch (err) {
+      this.db.close();
+      throw err;
+    }
+  }
+
+  /**
+   * Switching a new file to WAL needs an exclusive lock, and SQLite reports SQLITE_BUSY at once
+   * (without waiting out busy_timeout) when another connection holds a lock, as happens when
+   * several processes open a new database at the same moment. Retry for up to the busy timeout,
+   * as any other statement would wait. (Synchronous, like busy_timeout itself: the constructor
+   * can't await.)
+   */
+  private retryWhileBusy(fn: () => void, timeoutMs: number): void {
+    const deadline = Date.now() + timeoutMs;
+    for (let waitMs = 2; ; waitMs = Math.min(waitMs * 2, 50)) {
+      try {
+        return fn();
+      } catch (err) {
+        const busy = (err as { errcode?: number }).errcode === SQLITE_BUSY;
+        if (!busy || Date.now() >= deadline) throw err;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waitMs);
+      }
+    }
   }
 
   private stmt(sql: string): StatementSync {
@@ -60,7 +101,58 @@ export class SqliteStore implements Store {
     return this.stmt(sql).all(...params) as Row[];
   }
 
+  /**
+   * Runs `fn` in a transaction that takes the write lock up front (BEGIN IMMEDIATE), so other
+   * connections and processes wait (up to busy_timeout) until it commits.
+   *
+   * `fn` must be synchronous: the connection is shared by all async code in this process, and
+   * anything that ran between BEGIN and COMMIT would become part of the transaction.
+   *
+   * IMMEDIATE rather than a deferred BEGIN: in WAL mode a deferred transaction that reads and
+   * then writes fails with SQLITE_BUSY_SNAPSHOT (which busy_timeout does not retry) if another
+   * connection committed in between. Taking the lock first means every read inside `fn` sees
+   * the latest data and nothing can change it before COMMIT.
+   */
+  private immediate<T>(fn: () => T): T {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = fn();
+      this.db.exec("COMMIT");
+      return result;
+    } catch (err) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // SQLite already rolled back; report the original error.
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Bring the schema up to date. Safe when several processes (say `serve` and workers starting
+   * together on a new file) migrate at once: each migration runs in a BEGIN IMMEDIATE
+   * transaction that re-reads the version under the write lock, so a process that waited for
+   * the lock sees the migration another one just applied and skips it.
+   */
   async migrate(): Promise<number> {
+    const latest = MIGRATIONS.length;
+    // Up to date (the usual case): no lock needed. A newer schema is refused before any write.
+    if (this.assertKnownVersion() === latest) return latest;
+    for (;;) {
+      const applied = this.immediate(() => {
+        const current = this.assertKnownVersion();
+        if (current === latest) return false;
+        this.db.exec(MIGRATIONS[current]!);
+        this.db.exec(`PRAGMA user_version = ${current + 1}`);
+        return true;
+      });
+      if (!applied) return latest;
+    }
+  }
+
+  /** The schema version, refusing one written by a newer release. */
+  private assertKnownVersion(): number {
     const current = Number((this.db.prepare("PRAGMA user_version").get() as Row).user_version);
     if (current > MIGRATIONS.length) {
       // Written by a newer release; running older code against it could corrupt data.
@@ -69,18 +161,7 @@ export class SqliteStore implements Store {
           "upgrade Conveyor to open it",
       );
     }
-    for (let i = current; i < MIGRATIONS.length; i++) {
-      this.db.exec("BEGIN");
-      try {
-        this.db.exec(MIGRATIONS[i]!);
-        this.db.exec(`PRAGMA user_version = ${i + 1}`);
-        this.db.exec("COMMIT");
-      } catch (err) {
-        this.db.exec("ROLLBACK");
-        throw err;
-      }
-    }
-    return MIGRATIONS.length;
+    return current;
   }
 
   async close(): Promise<void> {
@@ -92,17 +173,30 @@ export class SqliteStore implements Store {
     this.insertJobRow(job);
   }
 
-  async insertJobs(jobs: Job[], events: NewJobEvent[]): Promise<void> {
-    // Synchronous from BEGIN to COMMIT, so no other caller's writes can land inside it.
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      for (const job of jobs) this.insertJobRow(job);
-      for (const e of events) this.insertEventRow(e.jobId, e.type, e.data, e.at);
-      this.db.exec("COMMIT");
-    } catch (err) {
-      this.db.exec("ROLLBACK");
-      throw err;
-    }
+  async insertJobs(jobs: Job[], events: NewJobEvent[]): Promise<Job[]> {
+    // The key check and the insert are in one transaction under the write lock, so no other
+    // connection or process can insert the same key in between. (The unique index would refuse
+    // it anyway; this turns that into "here is the existing job" instead of an error.)
+    return this.immediate(() => {
+      const notInserted = new Set<string>();
+      const stored = jobs.map((job) => {
+        const holder = job.uniqueKey !== null && isUnfinished(job.state) ? this.holderOfKey(job.queue, job.uniqueKey) : undefined;
+        if (holder) {
+          notInserted.add(job.id);
+          return holder;
+        }
+        this.insertJobRow(job);
+        return job;
+      });
+      for (const e of events) if (!notInserted.has(e.jobId)) this.insertEventRow(e.jobId, e.type, e.data, e.at);
+      return stored;
+    });
+  }
+
+  /** The unfinished job holding a queue's unique key, if any. */
+  private holderOfKey(queue: string, uniqueKey: string): Job | undefined {
+    const row = this.get(`SELECT * FROM jobs WHERE queue = ? AND unique_key = ? AND state IN ${UNFINISHED} LIMIT 1`, queue, uniqueKey);
+    return row ? toJob(row) : undefined;
   }
 
   private insertJobRow(job: Job): void {
@@ -139,16 +233,6 @@ export class SqliteStore implements Store {
 
   async getJob(id: string): Promise<Job | undefined> {
     const row = this.get("SELECT * FROM jobs WHERE id = ?", id);
-    return row ? toJob(row) : undefined;
-  }
-
-  async findActiveByUniqueKey(queue: string, uniqueKey: string): Promise<Job | undefined> {
-    const row = this.get(
-      `SELECT * FROM jobs WHERE queue = ? AND unique_key = ?
-         AND state IN ('delayed', 'waiting', 'active') ORDER BY id LIMIT 1`,
-      queue,
-      uniqueKey,
-    );
     return row ? toJob(row) : undefined;
   }
 
@@ -196,6 +280,10 @@ export class SqliteStore implements Store {
   }
 
   async countActive(queue: string): Promise<number> {
+    return this.activeIn(queue);
+  }
+
+  private activeIn(queue: string): number {
     const row = this.get("SELECT COUNT(*) AS n FROM jobs WHERE queue = ? AND state = 'active'", queue);
     return Number(row?.n ?? 0);
   }
@@ -208,106 +296,227 @@ export class SqliteStore implements Store {
     return row?.t == null ? null : Number(row.t);
   }
 
-  async findClaimCandidate(query: ClaimCandidateQuery): Promise<Job | undefined> {
-    const queues = query.queues.filter((q) => !query.exclude?.includes(q));
+  async claimNext(p: ClaimParams): Promise<Job | undefined> {
+    // A cheap look without the write lock first, so that idle workers polling empty (or full,
+    // or paused) queues don't queue up for it. Only a hint: the decision is made again below,
+    // inside the transaction, where nothing can change under it.
+    if (this.pickClaimable(p) === undefined) return undefined;
+    return this.immediate(() => {
+      const id = this.pickClaimable(p);
+      if (id === undefined) return undefined;
+      const row = this.get(
+        `UPDATE jobs SET state = 'active', attempts = attempts + 1, worker_id = ?, lease_token = ?,
+           lease_expires_at = ?, started_at = ?, updated_at = ?, progress = 0
+         WHERE id = ? AND state = 'waiting'
+         RETURNING *`,
+        p.workerId,
+        p.leaseToken,
+        p.leaseExpiresAt,
+        p.now,
+        p.now,
+        id,
+      );
+      // Can't happen while the transaction holds the write lock; the state check is a second
+      // line of defence.
+      if (!row) return undefined;
+      const job = toJob(row);
+      this.insertEventRow(job.id, "claimed", { workerId: p.workerId, attempt: job.attempts }, p.now);
+      return job;
+    });
+  }
+
+  /** The id of the job claimNext would lease right now, if any. */
+  private pickClaimable(p: ClaimParams): string | undefined {
+    const queues = [...new Set(p.queues)].filter((q) => !p.exclude?.includes(q) && this.hasRoom(q));
     if (queues.length === 0) return undefined;
     const placeholders = queues.map(() => "?").join(", ");
-    const row = this.db
-      .prepare(
-        `SELECT * FROM jobs
-          WHERE queue IN (${placeholders}) AND state = 'waiting' AND run_at <= ?
-          ORDER BY priority DESC, run_at ASC, id ASC
-          LIMIT 1`,
-      )
-      .get(...queues, query.now) as Row | undefined;
-    return row ? toJob(row) : undefined;
-  }
-
-  async activateJob(id: string, p: ActivateParams): Promise<void> {
-    this.run(
-      `UPDATE jobs SET state = 'active', attempts = attempts + 1, worker_id = ?, lease_token = ?,
-         lease_expires_at = ?, started_at = ?, updated_at = ?, progress = 0
-       WHERE id = ?`,
-      p.workerId,
-      p.leaseToken,
-      p.leaseExpiresAt,
+    const row = this.get(
+      `SELECT id FROM jobs
+        WHERE queue IN (${placeholders}) AND state = 'waiting' AND run_at <= ?
+        ORDER BY priority DESC, run_at ASC, id ASC
+        LIMIT 1`,
+      ...queues,
       p.now,
-      p.now,
-      id,
     );
+    return row ? String(row.id) : undefined;
   }
 
-  async extendLease(id: string, leaseExpiresAt: number, now: number): Promise<void> {
-    this.run(
-      "UPDATE jobs SET lease_expires_at = ?, updated_at = ? WHERE id = ? AND state = 'active'",
+  /** Whether a queue may start another job: not paused, and below its concurrency limit (0 = none). */
+  private hasRoom(queue: string): boolean {
+    const q = this.get("SELECT paused, concurrency FROM queues WHERE name = ?", queue);
+    if (!q) return true; // never configured: defaults, no limits
+    if (Number(q.paused) === 1) return false;
+    const limit = Number(q.concurrency);
+    return limit <= 0 || this.activeIn(queue) < limit;
+  }
+
+  // Lease calls: each changes the job only while it is active and still holds the caller's
+  // lease token, and reports whether it did.
+
+  async extendLease(id: string, leaseToken: string, leaseExpiresAt: number, now: number): Promise<boolean> {
+    return this.changed(
+      `UPDATE jobs SET lease_expires_at = ?, updated_at = ?
+        WHERE id = ? AND state = 'active' AND lease_token = ?`,
       leaseExpiresAt,
       now,
       id,
+      leaseToken,
     );
   }
 
-  async updateProgress(id: string, progress: number, now: number): Promise<void> {
-    this.run("UPDATE jobs SET progress = ?, updated_at = ? WHERE id = ?", progress, now, id);
+  async updateProgress(id: string, leaseToken: string, progress: number, now: number): Promise<boolean> {
+    return this.changed(
+      "UPDATE jobs SET progress = ?, updated_at = ? WHERE id = ? AND state = 'active' AND lease_token = ?",
+      progress,
+      now,
+      id,
+      leaseToken,
+    );
   }
 
-  async completeJob(id: string, result: Json | null, now: number): Promise<void> {
-    this.run(
+  async completeJob(id: string, leaseToken: string, result: Json | null, now: number): Promise<boolean> {
+    return this.changed(
       `UPDATE jobs SET state = 'completed', result = ?, finished_at = ?, updated_at = ?,
          progress = 1, lease_token = NULL, lease_expires_at = NULL, last_error = NULL
-       WHERE id = ?`,
+       WHERE id = ? AND state = 'active' AND lease_token = ?`,
       result === null || result === undefined ? null : JSON.stringify(result),
       now,
       now,
       id,
+      leaseToken,
     );
   }
 
-  async scheduleRetry(id: string, error: string, runAt: number, now: number): Promise<void> {
-    this.run(
+  async scheduleRetry(id: string, leaseToken: string, error: string, runAt: number, now: number): Promise<boolean> {
+    return this.changed(
       `UPDATE jobs SET state = 'delayed', run_at = ?, last_error = ?, updated_at = ?,
          worker_id = NULL, lease_token = NULL, lease_expires_at = NULL
-       WHERE id = ?`,
+       WHERE id = ? AND state = 'active' AND lease_token = ?`,
       runAt,
       error,
       now,
       id,
+      leaseToken,
     );
   }
 
-  async markDead(id: string, error: string, now: number): Promise<void> {
-    this.run(
+  async markDead(id: string, leaseToken: string, error: string, now: number): Promise<boolean> {
+    return this.changed(
       `UPDATE jobs SET state = 'dead', last_error = ?, finished_at = ?, updated_at = ?,
          lease_token = NULL, lease_expires_at = NULL
-       WHERE id = ?`,
+       WHERE id = ? AND state = 'active' AND lease_token = ?`,
       error,
       now,
       now,
       id,
+      leaseToken,
     );
   }
 
-  async cancelJob(id: string, now: number): Promise<void> {
-    this.run(
+  /** Hand the job back untouched: it keeps its place, and the claim's attempt is returned. */
+  async releaseLease(id: string, leaseToken: string, now: number): Promise<boolean> {
+    return this.changed(
+      `UPDATE jobs SET state = 'waiting', updated_at = ?, worker_id = NULL, lease_token = NULL,
+         lease_expires_at = NULL, attempts = MAX(attempts - 1, 0)
+       WHERE id = ? AND state = 'active' AND lease_token = ?`,
+      now,
+      id,
+      leaseToken,
+    );
+  }
+
+  private changed(sql: string, ...params: SQLInputValue[]): boolean {
+    return Number(this.run(sql, ...params).changes) > 0;
+  }
+
+  async expireLease(p: ExpireLeaseParams): Promise<boolean> {
+    // Exactly the lease that was read: a heartbeat since then moved lease_expires_at, a new claim
+    // changed lease_token, and finishing, failing or cancelling changed the state.
+    const sameLease = "WHERE id = ? AND state = 'active' AND lease_token IS ? AND lease_expires_at = ?";
+    return this.immediate(() => {
+      const changed =
+        p.retryAt === null
+          ? this.changed(
+              `UPDATE jobs SET state = 'dead', last_error = ?, finished_at = ?, updated_at = ?,
+                 lease_token = NULL, lease_expires_at = NULL
+               ${sameLease}`,
+              p.error,
+              p.now,
+              p.now,
+              p.id,
+              p.leaseToken,
+              p.leaseExpiresAt,
+            )
+          : this.changed(
+              `UPDATE jobs SET state = 'delayed', run_at = ?, last_error = ?, updated_at = ?,
+                 worker_id = NULL, lease_token = NULL, lease_expires_at = NULL
+               ${sameLease}`,
+              p.retryAt,
+              p.error,
+              p.now,
+              p.id,
+              p.leaseToken,
+              p.leaseExpiresAt,
+            );
+      if (changed) this.insertEventRow(p.id, "lease_expired", p.event, p.now);
+      return changed;
+    });
+  }
+
+  async cancelJob(id: string, now: number): Promise<StateChange | undefined> {
+    return this.guardedChange(
+      id,
       `UPDATE jobs SET state = 'cancelled', finished_at = ?, updated_at = ?,
          lease_token = NULL, lease_expires_at = NULL
-       WHERE id = ?`,
+       WHERE id = ? AND state IN ('delayed', 'waiting', 'active')`,
+      [now, now, id],
+      "cancelled",
       now,
-      now,
-      id,
     );
   }
 
-  async requeueJob(id: string, now: number, resetAttempts: boolean): Promise<void> {
-    this.run(
-      `UPDATE jobs SET state = 'waiting', run_at = ?, updated_at = ?, finished_at = NULL,
-         worker_id = NULL, lease_token = NULL, lease_expires_at = NULL,
-         attempts = CASE WHEN ? THEN 0 ELSE attempts END
-       WHERE id = ?`,
-      now,
-      now,
-      resetAttempts ? 1 : 0,
+  async retryJob(id: string, now: number): Promise<StateChange | undefined> {
+    return this.guardedChange(
       id,
+      `UPDATE jobs SET state = 'waiting', run_at = ?, updated_at = ?, finished_at = NULL,
+         worker_id = NULL, lease_token = NULL, lease_expires_at = NULL, attempts = 0
+       WHERE id = ? AND state IN ('dead', 'cancelled')`,
+      [now, now, id],
+      "retried",
+      now,
+      // Coming back would make it unfinished again: not while another unfinished job has its key.
+      (row) => {
+        if (row.unique_key === null || !["dead", "cancelled"].includes(String(row.state))) return undefined;
+        const holder = this.holderOfKey(String(row.queue), String(row.unique_key));
+        return holder ? { jobId: holder.id, uniqueKey: String(row.unique_key) } : undefined;
+      },
     );
+  }
+
+  /**
+   * Runs an UPDATE whose WHERE clause carries the allowed source states, so it can never apply
+   * to a job in any other state. In the same transaction, reads the job beforehand (to report
+   * its state, and for `blockedBy`, which can refuse the change) and records `eventType` when
+   * the update applied.
+   */
+  private guardedChange(
+    id: string,
+    update: string,
+    params: SQLInputValue[],
+    eventType: string,
+    now: number,
+    blockedBy?: (row: Row) => StateChange["heldBy"],
+  ): StateChange | undefined {
+    return this.immediate(() => {
+      const row = this.get("SELECT state, queue, unique_key FROM jobs WHERE id = ?", id);
+      if (!row) return undefined;
+      const from = String(row.state) as JobState;
+      const heldBy = blockedBy?.(row);
+      if (heldBy) return { changed: false, from, heldBy };
+      const changed = this.changed(update, ...params);
+      if (changed) this.insertEventRow(id, eventType, { previousState: from }, now);
+      return { changed, from };
+    });
   }
 
   async findExpiredLeases(now: number, limit: number): Promise<Job[]> {
@@ -317,17 +526,6 @@ export class SqliteStore implements Store {
       now,
       limit,
     ).map(toJob);
-  }
-
-  /** Hand the job back untouched: it keeps its place, and the claim's attempt is returned. */
-  async releaseLease(id: string, now: number): Promise<void> {
-    this.run(
-      `UPDATE jobs SET state = 'waiting', updated_at = ?, worker_id = NULL, lease_token = NULL,
-         lease_expires_at = NULL, attempts = MAX(attempts - 1, 0)
-       WHERE id = ?`,
-      now,
-      id,
-    );
   }
 
   async promoteDelayed(now: number, limit: number): Promise<number> {
@@ -351,14 +549,6 @@ export class SqliteStore implements Store {
       limit,
     );
     return Number(res.changes);
-  }
-
-  async hasUnfinishedForSchedule(scheduleId: string): Promise<boolean> {
-    const row = this.get(
-      `SELECT 1 AS x FROM jobs WHERE schedule_id = ? AND state IN ('delayed', 'waiting', 'active') LIMIT 1`,
-      scheduleId,
-    );
-    return row !== undefined;
   }
 
   async appendJobEvent(jobId: string, type: string, data: Json | null, at: number): Promise<void> {
@@ -444,25 +634,51 @@ export class SqliteStore implements Store {
     );
   }
 
-  async updateSchedule(s: Schedule): Promise<void> {
-    this.run(
-      `UPDATE schedules SET name = ?, queue = ?, job_name = ?, payload = ?, cron = ?, timezone = ?,
-         enabled = ?, overlap = ?, next_run_at = ?, last_run_at = ?, last_job_id = ?, updated_at = ?
-       WHERE id = ?`,
-      s.name,
-      s.queue,
-      s.jobName,
-      JSON.stringify(s.payload ?? null),
-      s.cron,
-      s.timezone,
-      s.enabled ? 1 : 0,
-      s.overlap,
-      s.nextRunAt,
-      s.lastRunAt,
-      s.lastJobId,
-      s.updatedAt,
-      s.id,
-    );
+  async updateSchedule(id: string, patch: SchedulePatch): Promise<boolean> {
+    const sets: string[] = [];
+    const params: SQLInputValue[] = [];
+    for (const [key, value] of Object.entries(patch) as [keyof SchedulePatch, unknown][]) {
+      if (value === undefined) continue;
+      const column = SCHEDULE_COLUMNS[key];
+      if (!column) throw new Error(`schedule has no column for ${String(key)}`);
+      sets.push(`${column} = ?`);
+      params.push(scheduleValue(key, value));
+    }
+    if (sets.length === 0) return (await this.getSchedule(id)) !== undefined;
+    return this.changed(`UPDATE schedules SET ${sets.join(", ")} WHERE id = ?`, ...params, id);
+  }
+
+  async fireSchedule(p: FireScheduleParams): Promise<FireOutcome> {
+    return this.immediate(() => {
+      // Still this slot? Another scheduler may have fired it, or the schedule was disabled,
+      // retimed or deleted since it was read. Either way, not ours to fire.
+      const slot = "WHERE id = ? AND enabled = 1 AND next_run_at = ? AND cron = ? AND timezone = ?";
+      const row = this.get(`SELECT overlap FROM schedules ${slot}`, p.scheduleId, p.slot, p.cron, p.timezone);
+      if (!row) return "stale";
+      const skip =
+        String(row.overlap) === "skip" &&
+        this.get(`SELECT 1 AS x FROM jobs WHERE schedule_id = ? AND state IN ${UNFINISHED} LIMIT 1`, p.scheduleId) !== undefined;
+      if (!skip) {
+        this.insertJobRow(p.job);
+        this.insertEventRow(p.job.id, "enqueued", { state: p.job.state }, p.now);
+      }
+      // Only the timing columns: an edit made meanwhile to anything else is kept.
+      this.run(
+        `UPDATE schedules SET last_run_at = ?, next_run_at = ?, updated_at = ?,
+           last_job_id = CASE WHEN ? THEN last_job_id ELSE ? END
+         ${slot}`,
+        p.slot,
+        p.nextRunAt,
+        p.now,
+        skip ? 1 : 0,
+        p.job.id,
+        p.scheduleId,
+        p.slot,
+        p.cron,
+        p.timezone,
+      );
+      return skip ? "skipped" : "fired";
+    });
   }
 
   async getSchedule(id: string): Promise<Schedule | undefined> {
@@ -646,6 +862,27 @@ function toQueue(r: Row): QueueSettings {
     createdAt: n(r.created_at),
     updatedAt: n(r.updated_at),
   };
+}
+
+const SCHEDULE_COLUMNS: Record<keyof SchedulePatch, string> = {
+  name: "name",
+  queue: "queue",
+  jobName: "job_name",
+  payload: "payload",
+  cron: "cron",
+  timezone: "timezone",
+  enabled: "enabled",
+  overlap: "overlap",
+  nextRunAt: "next_run_at",
+  lastRunAt: "last_run_at",
+  lastJobId: "last_job_id",
+  updatedAt: "updated_at",
+};
+
+function scheduleValue(key: keyof SchedulePatch, value: unknown): SQLInputValue {
+  if (key === "payload") return JSON.stringify(value ?? null);
+  if (key === "enabled") return value ? 1 : 0;
+  return value as SQLInputValue;
 }
 
 function toSchedule(r: Row): Schedule {

@@ -10,23 +10,12 @@ IDs are never reused. Fixed bugs are removed from this file (their tests stay, m
 
 | ID | Area | Summary | Owner | Test |
 | --- | --- | --- | --- | --- |
-| KB-1 | Reaper | Expired leases are requeued without checking `maxAttempts`, so a job that crashes its worker retries forever | concurrency work | `test/integration/maintenance.test.ts` |
 | KB-2 | API auth | Revoking every token turns authentication off | security work | `test/unit/auth.test.ts` |
 | KB-9 | Webhooks | `verify()` compares signatures with `===`, not in constant time | security work | none (see below) |
-| KB-11 | Store/broker | Two concurrent claims can both lease the same job: `activateJob` has no `state = 'waiting'` guard | concurrency work | `test/integration/store-contract.ts` |
-| KB-12 | Broker | A queue's `concurrency` limit is exceeded by parallel claims (count, then activate) | concurrency work | `test/integration/broker.test.ts` |
-| KB-13 | Store | `cancelJob` (and the reaper's `requeueJob`) update by id only, so they can overwrite a job that finished in between | concurrency work | `test/integration/store-contract.ts` |
-| KB-14 | Store | Nothing in the database enforces `uniqueKey`, so concurrent enqueues can both insert | concurrency work | `test/integration/store-contract.ts` |
-| KB-16 | Migrations | Suspected: two processes migrating a fresh database at the same time can fail | concurrency work | none (see below) |
-| KB-17 | Broker | A rate-limited queue blocks every other queue in the same claim | concurrency work | `test/integration/broker.test.ts` |
 | KB-23 | CLI worker | Jobs run by `conveyor worker` never produce webhooks | design change (cross-process events) | `test/integration/cli-e2e.test.ts` |
 | KB-24 | API auth | Right after the first token is created through the API, auth stays off for up to 2s | security work | `test/integration/api-auth.test.ts` |
 
 ## Details
-
-**KB-1. Reaper ignores `maxAttempts`.** `Maintenance.reap()` calls `requeueJob(id, now, false)`
-for every expired lease. The intended behaviour is that a job with no attempts left goes to
-`dead`. The test shows a job with `maxAttempts: 2` still `waiting` after two expired leases.
 
 **KB-2. Auth switches off after every token is revoked.** `tokensExist()` only enforces auth
 while an unrevoked token exists. The server process remembers a positive answer, but after a
@@ -36,23 +25,6 @@ after a leak, leaves every endpoint open, including `POST /v1/tokens`.
 **KB-9. Non-constant-time signature check.** `verify()` should use `crypto.timingSafeEqual`
 on equal-length buffers. Not unit-tested: a timing difference isn't something a unit test can
 reliably observe.
-
-**KB-11, KB-12, KB-13, KB-14. Races between claims, cancels, the reaper and enqueues.** The
-store's updates are unconditional (`WHERE id = ?`), and the broker and Conveyor check state in
-one call and write in another. The tests state the guard each operation needs.
-
-**KB-16. Concurrent first-time migration (suspected, not reproduced).** `migrate()` reads
-`user_version` outside the transaction and uses a deferred `BEGIN`. If `serve` and a `worker`
-start together on a new database file, both can decide to run migration 1. The second then
-fails with "table jobs already exists" once the first commits. It needs `BEGIN IMMEDIATE` and a
-re-read of the version inside the transaction. Not tested: it needs two processes, because a
-single process runs `migrate()` synchronously.
-
-**KB-17. Rate-limited queue blocks other queues.** From the first review. `claim()` picks the
-single best job across all the requested queues and only then asks that queue's rate limiter.
-If the limiter says no, `claim()` returns nothing, even when another queue in the same claim has
-work. The fix belongs in `claim()`: skip rate-limited queues, like paused and full ones. Left to
-the concurrency work, which is rewriting `claim()`.
 
 **KB-23. CLI workers don't trigger webhooks.** Events go over an in-process `EventBus`, and only
 `serve` starts a `WebhookDispatcher`. A job completed, retried or dead-lettered by a

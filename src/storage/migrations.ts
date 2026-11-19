@@ -118,4 +118,45 @@ export const MIGRATIONS: string[] = [
   `
   CREATE INDEX idx_deliveries_pending ON webhook_deliveries (status, next_attempt_at);
   `,
+  // 8 - at most one unfinished job per (queue, unique_key), enforced by the database.
+  //
+  // Older versions could create duplicates (two enqueues racing), and the unique index can't be
+  // created over them. So first, for each (queue, unique_key) with several unfinished jobs, one
+  // keeps the key: an active job if there is one (it is already running), otherwise the oldest
+  // (the first enqueued). The others:
+  //   - waiting or delayed: cancelled. They have not run, and not running a second copy is what
+  //     the unique key is for.
+  //   - active: keep running, but lose the key (unique_key = NULL). Cancelling a running job
+  //     would not undo the run, only lose its result.
+  // Every change is recorded in job_events with the id of the job that kept the key.
+  `
+  CREATE TEMP TABLE unique_key_duplicates AS
+    SELECT id, state, unique_key, FIRST_VALUE(id) OVER w AS kept_id, ROW_NUMBER() OVER w AS n
+      FROM jobs
+     WHERE unique_key IS NOT NULL AND state IN ('delayed', 'waiting', 'active')
+    WINDOW w AS (PARTITION BY queue, unique_key ORDER BY state = 'active' DESC, id);
+  DELETE FROM unique_key_duplicates WHERE n = 1;
+
+  INSERT INTO job_events (job_id, type, data, at)
+    SELECT id,
+           CASE WHEN state = 'active' THEN 'unique_key_released' ELSE 'cancelled' END,
+           CASE WHEN state = 'active'
+                THEN json_object('uniqueKey', unique_key, 'keptJobId', kept_id)
+                ELSE json_object('previousState', state, 'reason', 'duplicate unique key', 'keptJobId', kept_id)
+           END,
+           CAST(ROUND((julianday('now') - 2440587.5) * 86400000) AS INTEGER)
+      FROM unique_key_duplicates ORDER BY id;
+  UPDATE jobs
+     SET state = 'cancelled', lease_token = NULL, lease_expires_at = NULL,
+         finished_at = CAST(ROUND((julianday('now') - 2440587.5) * 86400000) AS INTEGER),
+         updated_at = CAST(ROUND((julianday('now') - 2440587.5) * 86400000) AS INTEGER)
+   WHERE id IN (SELECT id FROM unique_key_duplicates WHERE state != 'active');
+  UPDATE jobs
+     SET unique_key = NULL, updated_at = CAST(ROUND((julianday('now') - 2440587.5) * 86400000) AS INTEGER)
+   WHERE id IN (SELECT id FROM unique_key_duplicates WHERE state = 'active');
+  DROP TABLE unique_key_duplicates;
+
+  CREATE UNIQUE INDEX idx_jobs_unique_unfinished ON jobs (queue, unique_key)
+    WHERE unique_key IS NOT NULL AND state IN ('delayed', 'waiting', 'active');
+  `,
 ];

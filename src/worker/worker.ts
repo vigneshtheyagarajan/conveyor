@@ -14,7 +14,10 @@ export interface WorkerOptions {
   pollMs?: number;
   maxPollMs?: number;
   heartbeatMs?: number;
-  /** How long stop() waits for running jobs before aborting them. */
+  /**
+   * Grace period of stop(): how long it waits for running jobs to finish before aborting them
+   * and handing them back.
+   */
   shutdownTimeoutMs?: number;
   id?: string;
 }
@@ -40,6 +43,8 @@ interface Running {
   lease: Lease;
   controller: AbortController;
   done: Promise<void>;
+  /** Called by stop() when its grace period is over: stop waiting for this run. */
+  giveUp: () => void;
 }
 
 // In-process worker
@@ -47,11 +52,18 @@ export class Worker {
   readonly id: string;
   private state: WorkerState = "idle";
   private loops: Promise<void>[] = [];
+  /**
+   * Runs in progress, by lease token. Not by job id: a job can be running twice in this worker
+   * (its lease expired, the job was requeued and another loop claimed it), and each run must be
+   * tracked, and aborted on shutdown, on its own.
+   */
   private running = new Map<string, Running>();
   private stopController = new AbortController();
-  private wake?: () => void;
+  private stopping?: Promise<void>;
+  /** Wake-ups of the loops that are idle right now. */
+  private idleLoops = new Set<() => void>();
   private logger: Logger;
-  private unsubscribe?: () => void;
+  private unsubscribe: (() => void)[] = [];
   private readonly opts: Required<Omit<WorkerOptions, "id">>;
   private processedCount = 0;
   private failedCount = 0;
@@ -81,7 +93,7 @@ export class Worker {
       state: this.state,
       queues: this.opts.queues,
       concurrency: this.opts.concurrency,
-      running: [...this.running.keys()],
+      running: [...this.running.values()].map((r) => r.lease.job.id),
       processed: this.processedCount,
       failed: this.failedCount,
     };
@@ -90,21 +102,38 @@ export class Worker {
   start(): void {
     if (this.state !== "idle") throw new Error(`worker is ${this.state}`);
     this.state = "running";
-    this.unsubscribe = this.broker.conveyor.events.on("job.enqueued", (job) => {
-      if (this.opts.queues.includes(job.queue)) this.wake?.();
-    });
+    // Wake every idle loop when there may be new work: a job enqueued into, or a resume of, one
+    // of our queues. Each loop tries to claim; those that find nothing go back to sleep. (These
+    // are in-process events: work appearing through another process is found by polling.)
+    const events = this.broker.conveyor.events;
+    const wakeFor = (queue: string) => {
+      if (this.opts.queues.includes(queue)) for (const wake of [...this.idleLoops]) wake();
+    };
+    this.unsubscribe = [events.on("job.enqueued", (job) => wakeFor(job.queue)), events.on("queue.resumed", wakeFor)];
     for (let i = 0; i < this.opts.concurrency; i++) {
       this.loops.push(this.loop(i));
     }
     this.logger.info("worker started", { queues: this.opts.queues, concurrency: this.opts.concurrency });
   }
 
-  async stop(): Promise<void> {
-    if (this.state === "stopped" || this.state === "stopping") return;
+  /**
+   * Stop taking jobs and shut down. Running jobs get `shutdownTimeoutMs` to finish; after that
+   * their signals are aborted and they are handed back (released, without using an attempt;
+   * a job that had already timed out is failed instead). Jobs claimed while stopping are handed
+   * back unrun. Every call returns the same promise, which resolves once all of that is done.
+   *
+   * A handler that ignores its abort signal keeps running after stop() resolves, while its job
+   * is already back in the queue: exit the process after stop() (`conveyor worker` does).
+   */
+  stop(): Promise<void> {
+    this.stopping ??= this.shutdown();
+    return this.stopping;
+  }
+
+  private async shutdown(): Promise<void> {
     this.state = "stopping";
-    this.stopController.abort();
-    this.wake?.();
-    this.unsubscribe?.();
+    this.stopController.abort(); // wakes every idle loop
+    for (const off of this.unsubscribe) off();
 
     const inFlight = [...this.running.values()].map((r) => r.done);
     let timer: NodeJS.Timeout | undefined;
@@ -116,7 +145,10 @@ export class Worker {
     clearTimeout(timer);
     if (result === "timeout") {
       this.logger.warn("shutdown timeout reached, aborting running jobs", { running: this.running.size });
-      for (const r of this.running.values()) r.controller.abort(new WorkerShutdownError());
+      for (const r of this.running.values()) {
+        r.controller.abort(new WorkerShutdownError());
+        r.giveUp();
+      }
     }
     await Promise.all(this.loops);
     this.state = "stopped";
@@ -155,12 +187,14 @@ export class Worker {
       // stop() may already have fired while this loop was claiming; its abort event is gone.
       if (stop.aborted) return resolve();
       const t = setTimeout(done, ms);
+      const idleLoops = this.idleLoops;
       function done() {
         clearTimeout(t);
         stop.removeEventListener("abort", done);
+        idleLoops.delete(done);
         resolve();
       }
-      this.wake = done;
+      idleLoops.add(done);
       stop.addEventListener("abort", done, { once: true });
     });
   }
@@ -171,12 +205,17 @@ export class Worker {
     const controller = new AbortController();
     let finish!: () => void;
     const done = new Promise<void>((r) => (finish = r));
-    this.running.set(job.id, { lease, controller, done });
+    let giveUp!: () => void;
+    const givenUp = new Promise<void>((r) => (giveUp = r));
+    this.running.set(token, { lease, controller, done, giveUp });
 
     const heartbeat = setInterval(() => {
       this.broker.heartbeat(job.id, token).catch((err) => {
         if (err instanceof LeaseLostError) {
-          log.warn("lease lost during execution");
+          // The lease is gone for good (reaped, cancelled, claimed by another worker).
+          clearInterval(heartbeat);
+          if (!controller.signal.aborted) log.warn("lease lost during execution");
+          else log.warn("lease lost while waiting for the handler to stop");
           controller.abort(err);
         } else {
           log.error("heartbeat failed", { err });
@@ -186,6 +225,7 @@ export class Worker {
     heartbeat.unref();
 
     let timeout: NodeJS.Timeout | undefined;
+    let handlerStopped: Promise<void> | undefined;
     const started = Date.now();
     try {
       const handler = this.opts.handlers.get(job.name);
@@ -202,8 +242,12 @@ export class Worker {
       };
 
       const run = Promise.resolve().then(() => handler(ctx));
-      // Stop waiting as soon as the job is aborted (timeout, lost lease, forced shutdown), even
-      // if the handler ignores its signal. Its eventual result is then discarded.
+      handlerStopped = run.then(
+        () => undefined,
+        () => undefined,
+      );
+      // Stop waiting for the result as soon as the job is aborted (timeout, lost lease, forced
+      // shutdown), even if the handler ignores its signal. Its eventual result is discarded.
       const aborted = new Promise<never>((_, reject) => {
         controller.signal.addEventListener("abort", () => reject(controller.signal.reason), { once: true });
       });
@@ -226,6 +270,16 @@ export class Worker {
         }
         return;
       }
+      if (controller.signal.reason instanceof JobTimeoutError && handlerStopped) {
+        // Timed out. Keep the lease (heartbeats go on) until the handler has actually stopped:
+        // recording the failure now would let the retry start while this run is still going.
+        // A handler that ignores its signal holds the job, and this loop, until it returns, or
+        // until stop() gives up on it.
+        log.warn("job timed out; waiting for its handler to stop before recording the failure", { timeoutMs: job.timeoutMs });
+        const outcome = await Promise.race([handlerStopped.then(() => "stopped" as const), givenUp.then(() => "shutdown" as const)]);
+        if (outcome === "stopped") log.info("timed-out handler stopped", { durationMs: Date.now() - started });
+        else log.warn("timed-out handler still running at shutdown; recording the failure anyway");
+      }
       this.failedCount++;
       if (err instanceof LeaseLostError) {
         log.warn("job finished after its lease was lost; result discarded");
@@ -234,13 +288,18 @@ export class Worker {
           await this.broker.fail(job.id, token, err);
           log.warn("job failed", { err, durationMs: Date.now() - started });
         } catch (failErr) {
-          log.error("could not record job failure", { err: failErr });
+          if (failErr instanceof LeaseLostError) {
+            // Reaped, cancelled or claimed by another worker meanwhile: the job is theirs now.
+            log.warn("job failed after its lease was lost; failure not recorded", { err });
+          } else {
+            log.error("could not record job failure", { err: failErr });
+          }
         }
       }
     } finally {
       clearInterval(heartbeat);
       if (timeout) clearTimeout(timeout);
-      this.running.delete(job.id);
+      this.running.delete(token);
       finish();
     }
   }

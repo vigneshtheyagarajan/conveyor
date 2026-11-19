@@ -174,6 +174,17 @@ describe("retry", () => {
     expect(await conveyor.retryAllDead("q")).toBe(0);
     expect((await conveyor.queueStats("other")).counts.dead).toBe(1);
   });
+
+  // It skips jobs someone else retried meanwhile (a ConflictError), but a real failure must
+  // not be swallowed.
+  it("retryAllDead passes on errors other than a job being retried meanwhile", async () => {
+    const { conveyor, broker } = await setup({ clock: manualClock() });
+    await conveyor.enqueue({ queue: "q", name: "x", maxAttempts: 1 });
+    const lease = await broker.claim(["q"], "w");
+    await broker.fail(lease!.job.id, lease!.token, "e");
+    conveyor.store.retryJob = () => Promise.reject(new Error("database is locked"));
+    await expect(conveyor.retryAllDead("q")).rejects.toThrow("database is locked");
+  });
 });
 
 describe("queue settings and stats", () => {

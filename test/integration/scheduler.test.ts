@@ -160,8 +160,8 @@ describe("Scheduler.tick", () => {
   it("keeps firing the other schedules when one of them fails", async () => {
     const { logger, records } = memoryLogger();
     const { scheduler: s, conveyor, clock } = await scheduler({ logger });
-    const broken: Schedule = { ...(await s.create(input({ name: "broken" }))), jobName: "not a valid name", nextRunAt: clock.now() + MIN };
-    await conveyor.store.updateSchedule(broken); // e.g. written by an older release
+    const broken = await s.create(input({ name: "broken" }));
+    await conveyor.store.updateSchedule(broken.id, { jobName: "not a valid name", nextRunAt: clock.now() + MIN }); // e.g. written by an older release
     const good = await s.create(input({ name: "good" }));
     clock.advance(5 * MIN);
 

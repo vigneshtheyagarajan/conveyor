@@ -6,13 +6,17 @@ import { manualClock, memoryLogger, setup } from "../helpers.js";
 const DAY = 24 * 60 * 60 * 1000;
 
 describe("reaper", () => {
-  it("requeues jobs whose lease expired, keeping the attempt they used", async () => {
+  // A lease expiry is a failed attempt: the job waits out its normal retry backoff, as if the
+  // handler had thrown, instead of going straight back to the queue.
+  it("counts an expired lease as a failed attempt and retries it after the backoff", async () => {
     const clock = manualClock();
     const { conveyor, broker } = await setup({ clock }); // leaseMs 1000
-    const reaped: Job[] = [];
-    conveyor.events.on("job.reaped", (j) => reaped.push(j));
-    const m = new Maintenance(conveyor);
-    const job = await conveyor.enqueue({ queue: "q", name: "x" });
+    const seen: string[] = [];
+    conveyor.events.on("job.reaped", (j) => seen.push(`reaped ${j.state}`));
+    conveyor.events.on("job.failed", (j, err) => seen.push(`failed ${j.state}: ${err}`));
+    conveyor.events.on("job.retrying", (j, _err, delay) => seen.push(`retrying in ${delay}`));
+    const m = new Maintenance(conveyor, { random: () => 0.5 });
+    const job = await conveyor.enqueue({ queue: "q", name: "x" }); // default backoff: exponential from 1s, jitter
     const lease = await broker.claim(["q"], "crashed-worker");
 
     clock.advance(1000); // expires exactly now: not yet
@@ -20,10 +24,27 @@ describe("reaper", () => {
     clock.advance(1);
     expect(await m.reap()).toBe(1);
 
-    expect(await conveyor.getJob(job.id)).toMatchObject({ state: "waiting", attempts: 1, workerId: null, leaseToken: null, runAt: clock.now() });
-    expect((await conveyor.jobEvents(job.id)).at(-1)).toMatchObject({ type: "lease_expired", data: { workerId: "crashed-worker" } });
-    expect(reaped.map((j) => j.id)).toEqual([job.id]);
+    const error = "lease expired; worker crashed-worker may have crashed or stalled";
+    const delay = 750; // attempt 1: 1000ms, jittered with random 0.5
+    expect(await conveyor.getJob(job.id)).toMatchObject({
+      state: "delayed",
+      attempts: 1,
+      runAt: clock.now() + delay,
+      lastError: error,
+      workerId: null,
+      leaseToken: null,
+      leaseExpiresAt: null,
+    });
+    expect((await conveyor.jobEvents(job.id)).at(-1)).toMatchObject({
+      type: "lease_expired",
+      data: { workerId: "crashed-worker", attempts: 1, outcome: "retry", delayMs: delay },
+    });
+    expect(seen).toEqual(["reaped delayed", `failed delayed: ${error}`, `retrying in ${delay}`]);
     await expect(broker.complete(job.id, lease!.token)).rejects.toThrow("no longer held");
+
+    expect(await broker.claim(["q"], "w2")).toBeUndefined(); // not before the backoff
+    clock.advance(delay);
+    expect(await m.promote()).toBe(1);
     expect((await broker.claim(["q"], "w2"))?.job.attempts).toBe(2);
   });
 
@@ -55,33 +76,57 @@ describe("reaper", () => {
     expect(await m.reap()).toBe(0);
   });
 
-  it("logs each requeue as a warning", async () => {
+  it("logs each expired lease: a warning when it is retried, an error when the job is dead", async () => {
     const clock = manualClock();
     const { logger, records } = memoryLogger();
     const { conveyor, broker } = await setup({ clock, logger });
-    const job = await conveyor.enqueue({ queue: "q", name: "x" });
+    const m = new Maintenance(conveyor, { random: () => 0.5 });
+    const retried = await conveyor.enqueue({ queue: "q", name: "x", backoff: { type: "fixed", delayMs: 100 } });
+    const dead = await conveyor.enqueue({ queue: "q", name: "x", maxAttempts: 1 });
     await broker.claim(["q"], "w9");
+    await broker.claim(["q"], "w8");
     clock.advance(5000);
-    await new Maintenance(conveyor).reap();
+    expect(await m.reap()).toBe(2);
     expect(records).toContainEqual(
-      expect.objectContaining({ level: "warn", msg: "lease expired, job requeued", jobId: job.id, workerId: "w9", component: "maintenance" }),
+      expect.objectContaining({ level: "warn", msg: "lease expired, retry scheduled", jobId: retried.id, workerId: "w9", retryInMs: 100, component: "maintenance" }),
+    );
+    expect(records).toContainEqual(
+      expect.objectContaining({ level: "error", msg: "lease expired, job is dead", jobId: dead.id, workerId: "w8", component: "maintenance" }),
     );
   });
 
-  // BUG(KB-1): the reaper requeues every expired lease without looking at maxAttempts, so a job
-  // that crashes its worker every time is retried forever. It should go to dead.
-  it.fails("moves a job with no attempts left to dead instead of requeueing it [KB-1]", async () => {
+  // Regression (was KB-1): the reaper requeued every expired lease without looking at
+  // maxAttempts, so a job that crashed its worker every time was retried forever.
+  it("moves a job to dead when the lease of its last attempt expires", async () => {
     const clock = manualClock();
     const { conveyor, broker } = await setup({ clock });
-    const m = new Maintenance(conveyor);
-    const job = await conveyor.enqueue({ queue: "q", name: "x", maxAttempts: 2 });
+    const seen: string[] = [];
+    conveyor.events.on("job.failed", (j) => seen.push(`failed ${j.state}`));
+    conveyor.events.on("job.dead", (j, err) => seen.push(`dead: ${err}`));
+    const m = new Maintenance(conveyor, { random: () => 0.5 });
+    const job = await conveyor.enqueue({ queue: "q", name: "x", maxAttempts: 2, backoff: { type: "fixed", delayMs: 5000 } });
     for (let i = 0; i < 2; i++) {
       expect(await broker.claim(["q"], "w")).toBeDefined();
-      clock.advance(5000);
-      await m.reap();
+      clock.advance(5000); // the lease (1000ms) expires
+      expect(await m.reap()).toBe(1);
+      clock.advance(5000); // the retry backoff
+      await m.promote();
     }
-    expect(await conveyor.getJob(job.id)).toMatchObject({ state: "dead", attempts: 2 });
+    const error = "lease expired 2 times; worker may be crashing";
+    expect(await conveyor.getJob(job.id)).toMatchObject({ state: "dead", attempts: 2, lastError: error, leaseToken: null, finishedAt: clock.now() - 5000 });
     expect(await broker.claim(["q"], "w")).toBeUndefined();
+    expect(seen).toEqual(["failed delayed", "failed dead", `dead: ${error}`]);
+    expect((await conveyor.jobEvents(job.id)).at(-1)).toMatchObject({ type: "lease_expired", data: { attempts: 2, outcome: "dead" } });
+  });
+
+  it("says 'once' when a single expired lease used up the job's only attempt", async () => {
+    const clock = manualClock();
+    const { conveyor, broker } = await setup({ clock });
+    const job = await conveyor.enqueue({ queue: "q", name: "x", maxAttempts: 1 });
+    await broker.claim(["q"], "w");
+    clock.advance(5000);
+    await new Maintenance(conveyor).reap();
+    expect(await conveyor.getJob(job.id)).toMatchObject({ state: "dead", lastError: "lease expired once; worker may be crashing" });
   });
 });
 
@@ -189,7 +234,8 @@ describe("Maintenance.start / stop", () => {
     await vi.advanceTimersByTimeAsync(100);
     m.stop();
     expect((await conveyor.getJob(delayed.id)).state).toBe("waiting");
-    expect((await conveyor.getJob(lease!.job.id)).state).toBe("waiting");
+    // Reaped: a failed attempt, retried after its backoff.
+    expect(await conveyor.getJob(lease!.job.id)).toMatchObject({ state: "delayed", lastError: expect.stringContaining("lease expired") });
   });
 
   it("logs a failing task and keeps running", async () => {

@@ -3,6 +3,7 @@
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { main } from "../../src/cli/index.js";
+import { MIGRATIONS } from "../../src/storage/migrations.js";
 import { SqliteStore } from "../../src/storage/sqlite-store.js";
 import { tempDir } from "../helpers.js";
 
@@ -158,7 +159,7 @@ describe("migrate", () => {
   it("creates the database", async () => {
     const res = await cli("migrate");
     expect(res).toEqual({ code: 0, stdout: `database ready at ${db}\n`, stderr: "" });
-    expect(await withStore(async (s) => s.db.prepare("PRAGMA user_version").get())).toEqual({ user_version: 7 });
+    expect(await withStore(async (s) => s.db.prepare("PRAGMA user_version").get())).toEqual({ user_version: MIGRATIONS.length });
   });
 
   it("uses CONVEYOR_DB when --db is not given", async () => {
@@ -176,7 +177,7 @@ describe("migrate", () => {
     await withStore(async (s) => s.db.exec("PRAGMA user_version = 99"));
     const res = await cli("migrate");
     expect(res.code).toBe(1);
-    expect(res.stderr).toMatch(/^error: database schema version 99 is newer than this version of Conveyor supports \(7\)/);
+    expect(res.stderr).toMatch(new RegExp(`^error: database schema version 99 is newer than this version of Conveyor supports \\(${MIGRATIONS.length}\\)`));
   });
 });
 

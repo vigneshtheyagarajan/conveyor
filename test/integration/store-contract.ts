@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ApiToken, Job, JobState, QueueSettings, Schedule, Webhook, WebhookDelivery } from "../../src/core/types.js";
 import { JOB_STATES } from "../../src/core/types.js";
 import { MIGRATIONS } from "../../src/storage/migrations.js";
-import type { Store } from "../../src/storage/store.js";
+import type { ClaimParams, Store } from "../../src/storage/store.js";
 
 export const T = Date.UTC(2026, 0, 5, 12, 0, 0);
 
@@ -263,15 +263,21 @@ export function describeStoreContract(name: string, create: () => Promise<StoreH
       });
     });
 
-    describe("findActiveByUniqueKey", () => {
-      it("finds an unfinished job with the key in the same queue", async () => {
+    describe("insertJobs and unique keys", () => {
+      const enqueued = (job: Job) => ({ jobId: job.id, type: "enqueued", data: null, at: T });
+      const eventsOf = async (id: string) => (await store.listJobEvents(id)).map((e) => e.type);
+
+      it("returns the unfinished job holding the key instead of inserting, and drops its events", async () => {
         for (const state of ["delayed", "waiting", "active"] as JobState[]) {
-          const [j] = await insert(makeJob({ uniqueKey: `k-${state}`, state }));
-          expect((await store.findActiveByUniqueKey("q", `k-${state}`))?.id).toBe(j!.id);
+          const [holder] = await insert(makeJob({ uniqueKey: `k-${state}`, state }));
+          const dup = makeJob({ uniqueKey: `k-${state}`, payload: { other: true } });
+          expect(await store.insertJobs([dup], [enqueued(dup)])).toEqual([holder]);
+          expect(await store.getJob(dup.id)).toBeUndefined();
+          expect(await eventsOf(dup.id)).toEqual([]);
         }
       });
 
-      it("ignores finished jobs, other queues and other keys", async () => {
+      it("inserts when only finished jobs, other queues or other keys hold it", async () => {
         await insert(
           makeJob({ uniqueKey: "k", state: "completed" }),
           makeJob({ uniqueKey: "k", state: "dead" }),
@@ -279,12 +285,27 @@ export function describeStoreContract(name: string, create: () => Promise<StoreH
           makeJob({ uniqueKey: "k", queue: "other" }),
           makeJob({ uniqueKey: "k2" }),
         );
-        expect(await store.findActiveByUniqueKey("q", "k")).toBeUndefined();
+        const job = makeJob({ uniqueKey: "k" });
+        expect(await store.insertJobs([job], [enqueued(job)])).toEqual([job]);
+        expect(await get(job.id)).toEqual(job);
+        expect(await eventsOf(job.id)).toEqual(["enqueued"]);
       });
 
-      it("returns the oldest match if there are several", async () => {
-        const [a] = await insert(makeJob({ uniqueKey: "k" }), makeJob({ uniqueKey: "k", state: "delayed" }));
-        expect((await store.findActiveByUniqueKey("q", "k"))?.id).toBe(a!.id);
+      it("de-duplicates within the batch, keeping the first, and still inserts the rest", async () => {
+        const first = makeJob({ uniqueKey: "k" });
+        const again = makeJob({ uniqueKey: "k" });
+        const other = makeJob();
+        const stored = await store.insertJobs([first, again, other], [enqueued(first), enqueued(again), enqueued(other)]);
+        expect(stored).toEqual([first, first, other]);
+        expect(await store.getJob(again.id)).toBeUndefined();
+        expect(await eventsOf(first.id)).toEqual(["enqueued"]);
+        expect(await eventsOf(other.id)).toEqual(["enqueued"]);
+      });
+
+      it("keys finished jobs' new copies independently: a job inserted as finished is not checked", async () => {
+        await insert(makeJob({ uniqueKey: "k" }));
+        const finished = makeJob({ uniqueKey: "k", state: "completed" });
+        expect(await store.insertJobs([finished], [])).toEqual([finished]);
       });
     });
 
@@ -378,18 +399,44 @@ export function describeStoreContract(name: string, create: () => Promise<StoreH
       });
     });
 
-    describe("findClaimCandidate", () => {
+    describe("claimNext", () => {
+      let tokens = 0;
+      const claim = (over: Partial<ClaimParams> = {}) =>
+        store.claimNext({ queues: ["q"], workerId: "w1", leaseToken: `tok-${++tokens}`, leaseExpiresAt: T + 1000, now: T, ...over });
+
+      it("leases the job, counts the attempt and records the claim", async () => {
+        const [j] = await insert(makeJob({ attempts: 1, progress: 0.7 }));
+        const leased = await claim({ workerId: "w9", leaseToken: "tok", leaseExpiresAt: T + 1000, now: T + 5 });
+        expect(leased).toMatchObject({
+          id: j!.id,
+          state: "active",
+          attempts: 2,
+          workerId: "w9",
+          leaseToken: "tok",
+          leaseExpiresAt: T + 1000,
+          startedAt: T + 5,
+          updatedAt: T + 5,
+          progress: 0,
+        });
+        expect(await get(j!.id)).toEqual(leased);
+        const events = await store.listJobEvents(j!.id);
+        expect(events.map(({ type, data, at }) => ({ type, data, at }))).toEqual([
+          { type: "claimed", data: { workerId: "w9", attempt: 2 }, at: T + 5 },
+        ]);
+      });
+
       it("only considers waiting jobs that are due, in the given queues", async () => {
-        await insert(
+        const others = await insert(
           makeJob({ state: "delayed", runAt: T - 1 }),
-          makeJob({ state: "active", runAt: T - 1 }),
+          makeJob({ state: "active", runAt: T - 1, leaseToken: "held" }),
           makeJob({ state: "completed", runAt: T - 1 }),
           makeJob({ state: "waiting", runAt: T + 1 }),
           makeJob({ state: "waiting", queue: "other", runAt: T - 1 }),
         );
-        expect(await store.findClaimCandidate({ queues: ["q"], now: T })).toBeUndefined();
+        expect(await claim()).toBeUndefined();
+        for (const j of others) expect(await get(j.id)).toEqual(j);
         const [due] = await insert(makeJob({ runAt: T }));
-        expect((await store.findClaimCandidate({ queues: ["q"], now: T }))?.id).toBe(due!.id);
+        expect((await claim())?.id).toBe(due!.id);
       });
 
       it("orders by priority (high first), then run_at, then id", async () => {
@@ -402,12 +449,7 @@ export function describeStoreContract(name: string, create: () => Promise<StoreH
           makeJob({ priority: 5, runAt: T - 1 }),
         );
         const order: string[] = [];
-        for (;;) {
-          const c = await store.findClaimCandidate({ queues: ["q"], now: T });
-          if (!c) break;
-          order.push(c.id);
-          await store.completeJob(c.id, null, T);
-        }
+        for (let c = await claim(); c; c = await claim()) order.push(c.id);
         expect(order[0]).toBe(high!.id);
         expect(order.slice(1, 3)).toEqual([earlyTie!.id, lateTie!.id]);
         expect(order[order.length - 1]).toBe(low!.id);
@@ -416,55 +458,65 @@ export function describeStoreContract(name: string, create: () => Promise<StoreH
 
       it("searches across several queues and honours exclude", async () => {
         const [a, b] = await insert(makeJob({ queue: "a", priority: 1 }), makeJob({ queue: "b" }));
-        expect((await store.findClaimCandidate({ queues: ["a", "b"], now: T }))?.id).toBe(a!.id);
-        expect((await store.findClaimCandidate({ queues: ["a", "b"], now: T, exclude: ["a"] }))?.id).toBe(b!.id);
-        expect(await store.findClaimCandidate({ queues: ["a", "b"], now: T, exclude: ["a", "b"] })).toBeUndefined();
-        expect(await store.findClaimCandidate({ queues: [], now: T })).toBeUndefined();
+        expect(await claim({ queues: [] })).toBeUndefined();
+        expect(await claim({ queues: ["a", "b"], exclude: ["a", "b"] })).toBeUndefined();
+        expect((await claim({ queues: ["a", "b"], exclude: ["a"] }))?.id).toBe(b!.id);
+        expect((await claim({ queues: ["a", "b"] }))?.id).toBe(a!.id);
+      });
+
+      it("skips paused queues", async () => {
+        await store.upsertQueue(makeQueue({ name: "a", paused: true }));
+        const [, b] = await insert(makeJob({ queue: "a", priority: 10 }), makeJob({ queue: "b" }));
+        expect(await claim({ queues: ["a"] })).toBeUndefined();
+        expect((await claim({ queues: ["a", "b"] }))?.id).toBe(b!.id);
+      });
+
+      it("keeps each queue within its concurrency limit (0 means no limit)", async () => {
+        await store.upsertQueue(makeQueue({ name: "a", concurrency: 2 }));
+        await store.upsertQueue(makeQueue({ name: "b", concurrency: 0 }));
+        await insert(makeJob({ queue: "a", state: "active", leaseToken: "held" }));
+        await insert(...Array.from({ length: 3 }, () => makeJob({ queue: "a", priority: 1 })));
+        await insert(...Array.from({ length: 3 }, () => makeJob({ queue: "b" })));
+        expect((await claim({ queues: ["a", "b"] }))?.queue).toBe("a"); // 2 active in a now
+        const rest = [await claim({ queues: ["a", "b"] }), await claim({ queues: ["a", "b"] }), await claim({ queues: ["a", "b"] })];
+        expect(rest.map((j) => j?.queue)).toEqual(["b", "b", "b"]);
+        expect(await claim({ queues: ["a", "b"] })).toBeUndefined();
+        expect(await store.countActive("a")).toBe(2);
+      });
+
+      // Regression (was KB-11): activating a job did not check that it was still waiting, so a
+      // second claim of the same candidate re-leased a job another worker already held.
+      it("never leases a job that another worker holds", async () => {
+        const [held] = await insert(makeJob({ state: "active", workerId: "w1", leaseToken: "first", attempts: 1 }));
+        expect(await claim({ workerId: "w2" })).toBeUndefined();
+        expect(await get(held!.id)).toEqual(held);
+      });
+
+      it("leases each job once when claims run concurrently", async () => {
+        const jobs = await insert(...Array.from({ length: 5 }, () => makeJob()));
+        const leased = await Promise.all(Array.from({ length: 8 }, (_, i) => claim({ workerId: `w${i}` })));
+        const ids = leased.filter((j) => j !== undefined).map((j) => j.id);
+        expect(ids.toSorted()).toEqual(jobs.map((j) => j.id).toSorted());
+        for (const j of jobs) expect((await get(j.id)).attempts).toBe(1);
       });
     });
 
     describe("lease lifecycle", () => {
-      it("activateJob leases the job and counts the attempt", async () => {
-        const [j] = await insert(makeJob({ attempts: 1, progress: 0.7 }));
-        await store.activateJob(j!.id, { workerId: "w1", leaseToken: "tok", leaseExpiresAt: T + 1000, now: T + 5 });
-        expect(await get(j!.id)).toMatchObject({
-          state: "active",
-          attempts: 2,
-          workerId: "w1",
-          leaseToken: "tok",
-          leaseExpiresAt: T + 1000,
-          startedAt: T + 5,
-          updatedAt: T + 5,
-          progress: 0,
-        });
-      });
-
-      // BUG(KB-11): activateJob has no `state = 'waiting'` guard, so a second claim of the same
-      // candidate re-leases a job that another worker already holds.
-      it.fails("activateJob does not re-lease a job that is already active [KB-11]", async () => {
-        const [j] = await insert(makeJob());
-        await store.activateJob(j!.id, { workerId: "w1", leaseToken: "first", leaseExpiresAt: T + 1000, now: T });
-        await store.activateJob(j!.id, { workerId: "w2", leaseToken: "second", leaseExpiresAt: T + 1000, now: T });
-        expect(await get(j!.id)).toMatchObject({ workerId: "w1", leaseToken: "first", attempts: 1 });
-      });
-
-      it("extendLease moves the expiry of an active job only", async () => {
-        const [active, waiting] = await insert(makeJob({ state: "active", leaseExpiresAt: T }), makeJob({ state: "waiting" }));
-        await store.extendLease(active!.id, T + 5000, T + 1);
-        await store.extendLease(waiting!.id, T + 5000, T + 1);
-        expect(await get(active!.id)).toMatchObject({ leaseExpiresAt: T + 5000, updatedAt: T + 1 });
-        expect(await get(waiting!.id)).toEqual(waiting);
+      it("extendLease moves the expiry of the lease", async () => {
+        const [j] = await insert(makeJob({ state: "active", leaseToken: "tok", leaseExpiresAt: T }));
+        expect(await store.extendLease(j!.id, "tok", T + 5000, T + 1)).toBe(true);
+        expect(await get(j!.id)).toMatchObject({ leaseExpiresAt: T + 5000, updatedAt: T + 1 });
       });
 
       it("updateProgress stores the progress", async () => {
-        const [j] = await insert(makeJob({ state: "active" }));
-        await store.updateProgress(j!.id, 0.42, T + 9);
+        const [j] = await insert(makeJob({ state: "active", leaseToken: "tok" }));
+        expect(await store.updateProgress(j!.id, "tok", 0.42, T + 9)).toBe(true);
         expect(await get(j!.id)).toMatchObject({ progress: 0.42, updatedAt: T + 9 });
       });
 
       it("completeJob records the result and clears the lease and error", async () => {
         const [j] = await insert(makeJob({ state: "active", leaseToken: "tok", leaseExpiresAt: T + 1, lastError: "earlier", workerId: "w1" }));
-        await store.completeJob(j!.id, { sum: 5 }, T + 10);
+        expect(await store.completeJob(j!.id, "tok", { sum: 5 }, T + 10)).toBe(true);
         expect(await get(j!.id)).toMatchObject({
           state: "completed",
           result: { sum: 5 },
@@ -479,16 +531,16 @@ export function describeStoreContract(name: string, create: () => Promise<StoreH
       });
 
       it("completeJob stores a missing result as null", async () => {
-        const [a, b] = await insert(makeJob({ state: "active" }), makeJob({ state: "active" }));
-        await store.completeJob(a!.id, null, T);
-        await store.completeJob(b!.id, undefined as never, T);
+        const [a, b] = await insert(makeJob({ state: "active", leaseToken: "a" }), makeJob({ state: "active", leaseToken: "b" }));
+        await store.completeJob(a!.id, "a", null, T);
+        await store.completeJob(b!.id, "b", undefined as never, T);
         expect((await get(a!.id)).result).toBeNull();
         expect((await get(b!.id)).result).toBeNull();
       });
 
       it("scheduleRetry delays the job and releases the lease", async () => {
         const [j] = await insert(makeJob({ state: "active", attempts: 1, workerId: "w1", leaseToken: "tok", leaseExpiresAt: T + 1 }));
-        await store.scheduleRetry(j!.id, "boom", T + 2000, T);
+        expect(await store.scheduleRetry(j!.id, "tok", "boom", T + 2000, T)).toBe(true);
         expect(await get(j!.id)).toMatchObject({
           state: "delayed",
           runAt: T + 2000,
@@ -503,39 +555,143 @@ export function describeStoreContract(name: string, create: () => Promise<StoreH
 
       it("markDead finishes the job with the error", async () => {
         const [j] = await insert(makeJob({ state: "active", leaseToken: "tok", leaseExpiresAt: T + 1 }));
-        await store.markDead(j!.id, "gave up", T + 3);
+        expect(await store.markDead(j!.id, "tok", "gave up", T + 3)).toBe(true);
         expect(await get(j!.id)).toMatchObject({ state: "dead", lastError: "gave up", finishedAt: T + 3, leaseToken: null, leaseExpiresAt: null });
       });
 
-      it("cancelJob finishes the job and clears the lease", async () => {
-        const [j] = await insert(makeJob({ state: "active", leaseToken: "tok", leaseExpiresAt: T + 1 }));
-        await store.cancelJob(j!.id, T + 4);
-        expect(await get(j!.id)).toMatchObject({ state: "cancelled", finishedAt: T + 4, updatedAt: T + 4, leaseToken: null, leaseExpiresAt: null });
+      // A worker whose lease was taken away (expired and requeued, cancelled, or claimed by
+      // another worker) must not be able to change the job.
+      describe.each<[string, (id: string, token: string) => Promise<boolean>]>([
+        ["extendLease", (id, t) => store.extendLease(id, t, T + 5000, T + 1)],
+        ["updateProgress", (id, t) => store.updateProgress(id, t, 0.5, T + 1)],
+        ["completeJob", (id, t) => store.completeJob(id, t, { late: true }, T + 1)],
+        ["scheduleRetry", (id, t) => store.scheduleRetry(id, t, "late", T + 2000, T + 1)],
+        ["markDead", (id, t) => store.markDead(id, t, "late", T + 1)],
+        ["releaseLease", (id, t) => store.releaseLease(id, t, T + 1)],
+      ])("%s without the lease", (_name, call) => {
+        it("changes nothing and returns false when another lease token holds the job", async () => {
+          const [j] = await insert(makeJob({ state: "active", attempts: 1, workerId: "w2", leaseToken: "current", leaseExpiresAt: T + 1000 }));
+          expect(await call(j!.id, "stale")).toBe(false);
+          expect(await get(j!.id)).toEqual(j);
+        });
+
+        it("changes nothing and returns false when the job is no longer active", async () => {
+          const jobs = await insert(
+            makeJob({ state: "waiting", attempts: 1 }),
+            makeJob({ state: "completed", finishedAt: T }),
+            // Not a state the broker leaves behind, but the token alone must not be enough.
+            makeJob({ state: "delayed", leaseToken: "tok", runAt: T + 10 }),
+          );
+          for (const j of jobs) {
+            expect(await call(j.id, "tok")).toBe(false);
+            expect(await get(j.id)).toEqual(j);
+          }
+        });
+
+        it("returns false for a job that does not exist", async () => {
+          expect(await call("nope", "tok")).toBe(false);
+        });
       });
 
-      // BUG(KB-13): cancelJob (like the reaper's requeueJob) updates by id only, so a cancel that
-      // races a completion turns a completed job into a cancelled one.
-      it.fails("cancelJob leaves a job that already finished alone [KB-13]", async () => {
-        const [j] = await insert(makeJob({ state: "completed", result: { ok: 1 }, finishedAt: T }));
-        await store.cancelJob(j!.id, T + 1);
-        expect(await get(j!.id)).toMatchObject({ state: "completed", finishedAt: T });
+      const eventsOf = async (id: string) => (await store.listJobEvents(id)).map(({ type, data, at }) => ({ type, data, at }));
+
+      it("cancelJob cancels a delayed, waiting or active job, clears its lease and records it", async () => {
+        for (const state of ["delayed", "waiting", "active"] as JobState[]) {
+          const [j] = await insert(makeJob({ state, leaseToken: state === "active" ? "tok" : null, leaseExpiresAt: state === "active" ? T + 1 : null }));
+          expect(await store.cancelJob(j!.id, T + 4)).toEqual({ changed: true, from: state });
+          expect(await get(j!.id)).toMatchObject({ state: "cancelled", finishedAt: T + 4, updatedAt: T + 4, leaseToken: null, leaseExpiresAt: null });
+          expect(await eventsOf(j!.id)).toEqual([{ type: "cancelled", data: { previousState: state }, at: T + 4 }]);
+        }
+        expect(await store.cancelJob("nope", T)).toBeUndefined();
       });
 
-      it("requeueJob makes the job waiting now, optionally resetting attempts", async () => {
-        const [dead, active] = await insert(
-          makeJob({ state: "dead", attempts: 3, finishedAt: T, runAt: T - 500 }),
-          makeJob({ state: "active", attempts: 2, workerId: "w1", leaseToken: "tok", leaseExpiresAt: T }),
+      // Regression (was KB-13): cancelJob updated by id only, so a cancel that raced a
+      // completion turned a completed job into a cancelled one.
+      it("cancelJob leaves a job that already finished alone", async () => {
+        const finished = await insert(
+          makeJob({ state: "completed", result: { ok: 1 }, finishedAt: T }),
+          makeJob({ state: "dead", lastError: "boom", finishedAt: T }),
+          makeJob({ state: "cancelled", finishedAt: T }),
         );
-        await store.requeueJob(dead!.id, T + 7, true);
-        await store.requeueJob(active!.id, T + 7, false);
-        expect(await get(dead!.id)).toMatchObject({ state: "waiting", attempts: 0, runAt: T + 7, updatedAt: T + 7, finishedAt: null });
-        expect(await get(active!.id)).toMatchObject({
-          state: "waiting",
-          attempts: 2,
-          runAt: T + 7,
-          workerId: null,
-          leaseToken: null,
-          leaseExpiresAt: null,
+        for (const j of finished) {
+          expect(await store.cancelJob(j.id, T + 1)).toEqual({ changed: false, from: j.state });
+          expect(await get(j.id)).toEqual(j);
+          expect(await eventsOf(j.id)).toEqual([]);
+        }
+      });
+
+      it("retryJob puts a dead or cancelled job back to waiting, due now, with no attempts used", async () => {
+        for (const state of ["dead", "cancelled"] as JobState[]) {
+          const [j] = await insert(makeJob({ state, attempts: 3, finishedAt: T, runAt: T - 500, lastError: "boom", workerId: "w1" }));
+          expect(await store.retryJob(j!.id, T + 7)).toEqual({ changed: true, from: state });
+          expect(await get(j!.id)).toMatchObject({ state: "waiting", attempts: 0, runAt: T + 7, updatedAt: T + 7, finishedAt: null, workerId: null });
+          expect(await eventsOf(j!.id)).toEqual([{ type: "retried", data: { previousState: state }, at: T + 7 }]);
+        }
+        expect(await store.retryJob("nope", T)).toBeUndefined();
+      });
+
+      it("retryJob leaves every other job alone", async () => {
+        const others = await insert(
+          makeJob({ state: "delayed", runAt: T + 100 }),
+          makeJob({ state: "waiting", attempts: 1 }),
+          makeJob({ state: "active", attempts: 2, workerId: "w2", leaseToken: "tok", leaseExpiresAt: T + 1000 }),
+          makeJob({ state: "completed", finishedAt: T }),
+        );
+        for (const j of others) {
+          expect(await store.retryJob(j.id, T + 1)).toEqual({ changed: false, from: j.state });
+          expect(await get(j.id)).toEqual(j);
+          expect(await eventsOf(j.id)).toEqual([]);
+        }
+      });
+
+      describe("expireLease", () => {
+        const lease = { leaseToken: "tok", leaseExpiresAt: T - 1 };
+        const expiredJob = () => makeJob({ state: "active", attempts: 2, workerId: "w1", ...lease });
+
+        it("schedules a retry: delayed until retryAt, lease and worker cleared, event recorded", async () => {
+          const [j] = await insert(expiredJob());
+          const changed = await store.expireLease({ id: j!.id, ...lease, now: T, error: "lease expired", retryAt: T + 500, event: { outcome: "retry" } });
+          expect(changed).toBe(true);
+          expect(await get(j!.id)).toMatchObject({
+            state: "delayed",
+            runAt: T + 500,
+            lastError: "lease expired",
+            updatedAt: T,
+            attempts: 2,
+            workerId: null,
+            leaseToken: null,
+            leaseExpiresAt: null,
+          });
+          expect(await eventsOf(j!.id)).toEqual([{ type: "lease_expired", data: { outcome: "retry" }, at: T }]);
+        });
+
+        it("moves the job to dead when retryAt is null", async () => {
+          const [j] = await insert(expiredJob());
+          expect(await store.expireLease({ id: j!.id, ...lease, now: T, error: "lease expired twice", retryAt: null, event: null })).toBe(true);
+          expect(await get(j!.id)).toMatchObject({ state: "dead", lastError: "lease expired twice", finishedAt: T, leaseToken: null, leaseExpiresAt: null, workerId: "w1" });
+        });
+
+        it("changes nothing unless the job still has exactly the lease that was read", async () => {
+          const changedSince = await insert(
+            makeJob({ state: "active", leaseToken: "tok", leaseExpiresAt: T + 1000 }), // renewed by a heartbeat
+            makeJob({ state: "active", leaseToken: "other", leaseExpiresAt: T - 1 }), // claimed again
+            makeJob({ state: "completed", finishedAt: T }),
+            makeJob({ state: "delayed", leaseToken: "tok", leaseExpiresAt: T - 1 }), // failed (odd leftovers)
+            makeJob({ state: "cancelled", finishedAt: T }),
+          );
+          for (const j of changedSince) {
+            expect(await store.expireLease({ id: j.id, ...lease, now: T, error: "x", retryAt: T + 1, event: null })).toBe(false);
+            expect(await get(j.id)).toEqual(j);
+            expect(await eventsOf(j.id)).toEqual([]);
+          }
+          expect(await store.expireLease({ id: "nope", ...lease, now: T, error: "x", retryAt: T + 1, event: null })).toBe(false);
+        });
+
+        it("ends a lease only once", async () => {
+          const [j] = await insert(expiredJob());
+          const params = { id: j!.id, ...lease, now: T, error: "x", retryAt: T + 1, event: null };
+          expect(await Promise.all([store.expireLease(params), store.expireLease(params)])).toEqual([true, false]);
+          expect(await eventsOf(j!.id)).toHaveLength(1);
         });
       });
 
@@ -554,8 +710,8 @@ export function describeStoreContract(name: string, create: () => Promise<StoreH
       // Releasing is a clean hand-back, not a failure, so the attempt it used is given back.
       it("releaseLease makes the job waiting again and gives back the attempt", async () => {
         const [j] = await insert(makeJob({ runAt: T - 100 }));
-        await store.activateJob(j!.id, { workerId: "w1", leaseToken: "tok", leaseExpiresAt: T + 1000, now: T });
-        await store.releaseLease(j!.id, T + 1);
+        await store.claimNext({ queues: ["q"], workerId: "w1", leaseToken: "tok", leaseExpiresAt: T + 1000, now: T });
+        expect(await store.releaseLease(j!.id, "tok", T + 1)).toBe(true);
         expect(await get(j!.id)).toMatchObject({
           state: "waiting",
           attempts: 0,
@@ -568,8 +724,8 @@ export function describeStoreContract(name: string, create: () => Promise<StoreH
       });
 
       it("releaseLease never takes attempts below zero", async () => {
-        const [j] = await insert(makeJob({ state: "active", attempts: 0 }));
-        await store.releaseLease(j!.id, T);
+        const [j] = await insert(makeJob({ state: "active", attempts: 0, leaseToken: "tok" }));
+        await store.releaseLease(j!.id, "tok", T);
         expect((await get(j!.id)).attempts).toBe(0);
       });
     });
@@ -638,25 +794,22 @@ export function describeStoreContract(name: string, create: () => Promise<StoreH
       });
     });
 
-    describe("hasUnfinishedForSchedule", () => {
-      it("is true while a job from the schedule is delayed, waiting or active", async () => {
-        expect(await store.hasUnfinishedForSchedule("s")).toBe(false);
-        await insert(makeJob({ scheduleId: "s", state: "completed" }), makeJob({ scheduleId: "s", state: "dead" }), makeJob({ scheduleId: "other" }));
-        expect(await store.hasUnfinishedForSchedule("s")).toBe(false);
-        for (const state of ["delayed", "waiting", "active"] as JobState[]) {
-          const [j] = await insert(makeJob({ scheduleId: `s-${state}`, state }));
-          expect(await store.hasUnfinishedForSchedule(`s-${state}`)).toBe(true);
-          await store.completeJob(j!.id, null, T);
-          expect(await store.hasUnfinishedForSchedule(`s-${state}`)).toBe(false);
-        }
-      });
-    });
-
-    // BUG(KB-14): nothing in the store stops two unfinished jobs with the same unique key, so
-    // two concurrent enqueues that both pass Conveyor's check both get inserted.
-    it.fails("rejects a second unfinished job with the same queue and unique key [KB-14]", async () => {
+    // Regression (was KB-14): nothing in the store stopped two unfinished jobs with the same
+    // unique key, so two concurrent enqueues that both passed Conveyor's check both got inserted.
+    it("rejects a second unfinished job with the same queue and unique key", async () => {
       await insert(makeJob({ uniqueKey: "user:1" }));
-      await expect(store.insertJob(makeJob({ uniqueKey: "user:1" }))).rejects.toThrow();
+      for (const state of ["delayed", "waiting", "active"] as JobState[]) {
+        await expect(store.insertJob(makeJob({ uniqueKey: "user:1", state }))).rejects.toThrow();
+      }
+      // Finished jobs, other queues and jobs without a key are not constrained.
+      await insert(
+        makeJob({ uniqueKey: "user:1", state: "completed" }),
+        makeJob({ uniqueKey: "user:1", state: "dead" }),
+        makeJob({ uniqueKey: "user:1", state: "cancelled" }),
+        makeJob({ uniqueKey: "user:1", queue: "other" }),
+        makeJob(),
+        makeJob(),
+      );
     });
 
     describe("job events", () => {
@@ -746,8 +899,7 @@ export function describeStoreContract(name: string, create: () => Promise<StoreH
       it("updates every field except id and createdAt", async () => {
         const s = makeSchedule();
         await store.insertSchedule(s);
-        const changed: Schedule = {
-          ...s,
+        const patch = {
           name: "renamed",
           queue: "q2",
           jobName: "j2",
@@ -755,15 +907,101 @@ export function describeStoreContract(name: string, create: () => Promise<StoreH
           cron: "0 0 * * *",
           timezone: "Asia/Tokyo",
           enabled: false,
-          overlap: "skip",
+          overlap: "skip" as const,
           nextRunAt: T + 1,
           lastRunAt: T,
           lastJobId: "j9",
-          createdAt: T + 12345,
           updatedAt: T + 2,
         };
-        await store.updateSchedule(changed);
-        expect(await store.getSchedule(s.id)).toEqual({ ...changed, createdAt: T });
+        expect(await store.updateSchedule(s.id, patch)).toBe(true);
+        expect(await store.getSchedule(s.id)).toEqual({ ...s, ...patch });
+      });
+
+      it("writes only the given columns", async () => {
+        const s = makeSchedule({ payload: { a: 1 }, lastRunAt: T - 5, lastJobId: "j1" });
+        await store.insertSchedule(s);
+        expect(await store.updateSchedule(s.id, { enabled: false, updatedAt: T + 1 })).toBe(true);
+        expect(await store.updateSchedule(s.id, { payload: null })).toBe(true);
+        expect(await store.getSchedule(s.id)).toEqual({ ...s, enabled: false, payload: null, updatedAt: T + 1 });
+        expect(await store.updateSchedule(s.id, {})).toBe(true);
+        expect(await store.updateSchedule("nope", { enabled: false })).toBe(false);
+        expect(await store.updateSchedule("nope", {})).toBe(false);
+      });
+
+      describe("fireSchedule", () => {
+        const due = (over: Partial<Schedule> = {}) => makeSchedule({ cron: "* * * * *", timezone: "UTC", nextRunAt: T, payload: { p: 1 }, ...over });
+        const fire = (s: Schedule, job: Job, over: Partial<Parameters<Store["fireSchedule"]>[0]> = {}) =>
+          store.fireSchedule({ scheduleId: s.id, slot: s.nextRunAt, cron: s.cron, timezone: s.timezone, nextRunAt: T + 60_000, now: T + 5, job, ...over });
+        const jobsOf = async (s: Schedule) => (await store.listJobs({ scheduleId: s.id })).items.map((j) => j.id);
+
+        it("enqueues the job with its event and moves on, writing only the timing columns", async () => {
+          const s = due();
+          await store.insertSchedule(s);
+          const job = makeJob({ scheduleId: s.id });
+          expect(await fire(s, job)).toBe("fired");
+          expect(await get(job.id)).toEqual(job);
+          expect((await store.listJobEvents(job.id)).map(({ type, data, at }) => ({ type, data, at }))).toEqual([
+            { type: "enqueued", data: { state: "waiting" }, at: T + 5 },
+          ]);
+          expect(await store.getSchedule(s.id)).toEqual({ ...s, lastRunAt: T, nextRunAt: T + 60_000, lastJobId: job.id, updatedAt: T + 5 });
+        });
+
+        it("fires a slot once: firing it again is stale and changes nothing", async () => {
+          const s = due();
+          await store.insertSchedule(s);
+          const first = makeJob({ scheduleId: s.id });
+          const second = makeJob({ scheduleId: s.id });
+          const results = await Promise.all([fire(s, first), fire(s, second)]);
+          expect(results).toEqual(["fired", "stale"]);
+          expect(await jobsOf(s)).toEqual([first.id]);
+          expect((await store.getSchedule(s.id))?.lastJobId).toBe(first.id);
+        });
+
+        it("is stale, changing nothing, when the schedule was disabled, retimed or deleted since it was read", async () => {
+          for (const [what, change] of [
+            ["disabled", { enabled: false }],
+            ["moved to another slot", { nextRunAt: T + 1 }],
+            ["given another cron", { cron: "0 * * * *" }],
+            ["given another timezone", { timezone: "Asia/Tokyo" }],
+          ] as const) {
+            const s = due();
+            await store.insertSchedule(s);
+            await store.updateSchedule(s.id, change);
+            const before = await store.getSchedule(s.id);
+            expect({ what, outcome: await fire(s, makeJob({ scheduleId: s.id })) }).toEqual({ what, outcome: "stale" });
+            expect(await jobsOf(s)).toEqual([]);
+            expect(await store.getSchedule(s.id)).toEqual(before);
+          }
+          expect(await fire(due(), makeJob())).toBe("stale"); // never stored
+        });
+
+        it("overlap skip: skips while a run is delayed, waiting or active, and still moves on", async () => {
+          for (const state of ["delayed", "waiting", "active"] as JobState[]) {
+            const s = due({ overlap: "skip", lastJobId: "earlier" });
+            await store.insertSchedule(s);
+            const [running] = await insert(makeJob({ scheduleId: s.id, state }));
+            const job = makeJob({ scheduleId: s.id });
+            expect(await fire(s, job)).toBe("skipped");
+            expect(await jobsOf(s)).toEqual([running!.id]);
+            expect(await store.getSchedule(s.id)).toMatchObject({ lastRunAt: T, nextRunAt: T + 60_000, lastJobId: "earlier" });
+          }
+        });
+
+        it("overlap skip: finished runs and other schedules' runs don't count; allow ignores unfinished runs", async () => {
+          const skip = due({ overlap: "skip" });
+          const allow = due({ overlap: "allow" });
+          await store.insertSchedule(skip);
+          await store.insertSchedule(allow);
+          await insert(
+            makeJob({ scheduleId: skip.id, state: "completed" }),
+            makeJob({ scheduleId: skip.id, state: "dead" }),
+            makeJob({ scheduleId: skip.id, state: "cancelled" }),
+            makeJob({ scheduleId: "other", state: "waiting" }),
+            makeJob({ scheduleId: allow.id, state: "active" }),
+          );
+          expect(await fire(skip, makeJob({ scheduleId: skip.id }))).toBe("fired");
+          expect(await fire(allow, makeJob({ scheduleId: allow.id }))).toBe("fired");
+        });
       });
 
       it("lists by name and deletes", async () => {

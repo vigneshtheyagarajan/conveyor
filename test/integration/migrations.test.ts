@@ -178,7 +178,9 @@ async function expectSeededData(store: SqliteStore, version: number) {
     });
   }
   if (version >= 3) {
-    expect((await store.findActiveByUniqueKey("emails", "user:1"))?.id).toBe("job-unique");
+    // The migrated job still holds its unique key: enqueueing the key again gives it back.
+    const probe: Job = { ...EXPECTED_OLD_JOB, id: "probe", state: "waiting", uniqueKey: "user:1" };
+    expect((await store.insertJobs([probe], []))[0]?.id).toBe("job-unique");
     expect((await store.listJobEvents("job-old")).map(({ type, data, at }) => ({ type, data, at }))).toEqual([
       { type: "enqueued", data: { state: "delayed" }, at: T - 5000 },
       { type: "claimed", data: null, at: T - 100 },
@@ -201,7 +203,7 @@ async function expectSeededData(store: SqliteStore, version: number) {
       createdAt: T - 9000,
       updatedAt: T - 1,
     });
-    expect(await store.hasUnfinishedForSchedule("sched-1")).toBe(true);
+    expect((await store.listJobs({ scheduleId: "sched-1" })).items.some((j) => ["delayed", "waiting", "active"].includes(j.state))).toBe(true);
   }
   if (version >= 5) {
     expect(await store.getWebhook("hook-1")).toEqual({
@@ -257,7 +259,7 @@ describe("migrations", () => {
   });
 
   it("has one entry per schema version", () => {
-    expect(LATEST).toBe(7);
+    expect(LATEST).toBe(8);
     for (const m of MIGRATIONS) expect(m.trim().length).toBeGreaterThan(0);
   });
 
@@ -353,6 +355,63 @@ describe("migrations", () => {
     } finally {
       MIGRATIONS.pop();
     }
+  });
+
+  // Regression (was KB-14): migration 8 enforces one unfinished job per (queue, unique key).
+  // A database from before can hold several (the race this fixes created them). Creating the
+  // index would fail on those, so the migration first keeps one job per key: an active one if
+  // there is one (it is running; cancelling it would not undo that), otherwise the oldest. The
+  // other waiting or delayed duplicates are cancelled (they have not run, and not running them
+  // is what the key is for). Other active duplicates keep running but lose their key. Each
+  // change is recorded as a job event naming the job that kept the key.
+  it("resolves unfinished jobs that share a unique key before enforcing it", async () => {
+    const file = tmp.file();
+    const old = createAtVersion(file, 7);
+    const job = (id: string, over: Record<string, string | number | null>) =>
+      insertRow(old, "jobs", { ...OLD_JOB, id, queue: "q", state: "waiting", last_error: null, ...over });
+    // queue q, key k1: three unfinished, none active -> keep the oldest
+    job("j1a", { unique_key: "k1" });
+    job("j1b", { unique_key: "k1" });
+    job("j1c", { unique_key: "k1", state: "delayed" });
+    // queue q, key k2: one waiting, two active -> keep the first active one
+    job("j2a", { unique_key: "k2" });
+    job("j2b", { unique_key: "k2", state: "active", worker_id: "w1", lease_token: "t1", lease_expires_at: T + 1000 });
+    job("j2c", { unique_key: "k2", state: "active", worker_id: "w2", lease_token: "t2", lease_expires_at: T + 1000 });
+    // left alone: the same key in another queue, finished jobs with the key, a key held once
+    job("j3", { unique_key: "k1", queue: "other" });
+    job("j4", { unique_key: "k1", state: "completed", finished_at: T });
+    job("j5", { unique_key: "k2", state: "dead", finished_at: T });
+    job("j6", { unique_key: "k3" });
+    old.close();
+
+    store = new SqliteStore(file);
+    const before = Date.now();
+    expect(await store.migrate()).toBe(LATEST);
+    const after = Date.now();
+
+    const get = async (id: string) => (await store!.getJob(id))!;
+    for (const id of ["j1a", "j2b", "j3", "j4", "j5", "j6"]) {
+      const j = await get(id);
+      expect({ id, changed: j.updatedAt !== OLD_JOB.updated_at }).toEqual({ id, changed: false });
+    }
+    for (const [id, kept, previous] of [
+      ["j1b", "j1a", "waiting"],
+      ["j1c", "j1a", "delayed"],
+      ["j2a", "j2b", "waiting"],
+    ] as const) {
+      const j = await get(id);
+      expect(j).toMatchObject({ state: "cancelled", leaseToken: null, leaseExpiresAt: null });
+      expect(j.finishedAt).toBeGreaterThanOrEqual(before);
+      expect(j.finishedAt).toBeLessThanOrEqual(after);
+      const [event] = await store.listJobEvents(id);
+      expect(event).toMatchObject({ type: "cancelled", data: { previousState: previous, reason: "duplicate unique key", keptJobId: kept } });
+    }
+    expect(await get("j2c")).toMatchObject({ state: "active", uniqueKey: null, leaseToken: "t2" });
+    expect((await store.listJobEvents("j2c"))[0]).toMatchObject({ type: "unique_key_released", data: { uniqueKey: "k2", keptJobId: "j2b" } });
+
+    // From now on the database itself refuses a second unfinished job with a key.
+    await expect(store.insertJob({ ...EXPECTED_OLD_JOB, id: "j7", state: "waiting", uniqueKey: "k1", queue: "q" })).rejects.toThrow(/UNIQUE/);
+    await store.insertJob({ ...EXPECTED_OLD_JOB, id: "j8", state: "completed", uniqueKey: "k1", queue: "q" });
   });
 
   // Regression (was KB-15): a database migrated by a newer release was opened without

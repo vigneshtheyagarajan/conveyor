@@ -4,7 +4,12 @@ import type { Json } from "../util/json.js";
 
 export interface JobContext<P = Json> {
   job: Job & { payload: P };
-  /** Aborted when the job times out, is cancelled, or the worker is shutting down hard. */
+  /**
+   * Aborted when the job times out (reason: JobTimeoutError), its lease is lost because it was
+   * cancelled or reaped (LeaseLostError), or stop() runs out of patience (WorkerShutdownError).
+   * Stop work when it fires. See docs/architecture.md, "Handlers and their signal", for what
+   * happens to a handler that doesn't.
+   */
   signal: AbortSignal;
   logger: Logger;
   /** Report progress between 0 and 1. */

@@ -10,7 +10,6 @@ import type {
   QueueSettings,
   QueueStats,
 } from "./types.js";
-import { TERMINAL_STATES } from "./types.js";
 import type { Store } from "../storage/store.js";
 import { systemClock, type Clock } from "../util/clock.js";
 import { jobId } from "../util/ids.js";
@@ -87,38 +86,40 @@ export class Conveyor {
   private async enqueueMany(reqs: EnqueueRequest[]): Promise<Job[]> {
     reqs.forEach((r) => this.validate(r));
     const now = this.clock.now();
-    const results: Job[] = [];
-    const created: Job[] = [];
-    const byUniqueKey = new Map<string, Job>();
     const queues = new Map<string, QueueSettings>();
-
+    const jobs: Job[] = [];
     for (const req of reqs) {
-      const key = req.uniqueKey ? `${req.queue}\u0000${req.uniqueKey}` : undefined;
-      if (key) {
-        const existing = byUniqueKey.get(key) ?? (await this.store.findActiveByUniqueKey(req.queue, req.uniqueKey!));
-        if (existing) {
-          byUniqueKey.set(key, existing);
-          results.push(existing);
-          continue;
-        }
-      }
       let queue = queues.get(req.queue);
       if (!queue) queues.set(req.queue, (queue = await this.queueSettings(req.queue)));
-      const job = this.newJob(req, queue, now);
-      if (key) byUniqueKey.set(key, job);
-      created.push(job);
-      results.push(job);
+      jobs.push(this.newJob(req, queue, now));
     }
-
-    await this.store.insertJobs(
-      created,
-      created.map((job) => ({ jobId: job.id, type: "enqueued", data: { state: job.state }, at: now })),
+    // The store checks unique keys in the same transaction as the insert: a job whose key an
+    // unfinished job already holds (or one earlier in this batch) is not inserted, and that
+    // job is returned in its place.
+    const stored = await this.store.insertJobs(
+      jobs,
+      jobs.map((job) => ({ jobId: job.id, type: "enqueued", data: { state: job.state }, at: now })),
     );
-    for (const job of created) {
-      this.events.emit("job.enqueued", job);
-      this.logger.debug("job enqueued", { jobId: job.id, queue: job.queue, name: job.name });
-    }
-    return results;
+    stored.forEach((job, i) => {
+      if (job.id === jobs[i]!.id) this.announceEnqueued(job);
+    });
+    return stored;
+  }
+
+  /**
+   * Validate a request and build the job it would create, without storing it. For callers that
+   * store the job themselves as part of a larger atomic step (the scheduler), and then call
+   * announceEnqueued().
+   */
+  async buildJob(req: EnqueueRequest): Promise<Job> {
+    this.validate(req);
+    return this.newJob(req, await this.queueSettings(req.queue), this.clock.now());
+  }
+
+  /** Emit job.enqueued for a job that has been stored. */
+  announceEnqueued(job: Job): void {
+    this.events.emit("job.enqueued", job);
+    this.logger.debug("job enqueued", { jobId: job.id, queue: job.queue, name: job.name });
   }
 
   private newJob(req: EnqueueRequest, queue: QueueSettings, now: number): Job {
@@ -160,37 +161,53 @@ export class Conveyor {
     return this.store.listJobs(filter);
   }
 
+  /**
+   * Cancel a delayed, waiting or active job. The store checks the state and cancels in one
+   * step, so a job that completes or dies at the same moment is never overwritten: whichever
+   * lands first wins, and a cancel that lost gets a ConflictError. A worker running the job
+   * finds out at its next heartbeat (LeaseLostError), and its result is discarded.
+   */
   async cancel(id: string): Promise<Job> {
-    const job = await this.getJob(id);
-    if (TERMINAL_STATES.includes(job.state)) {
-      throw new ConflictError(`job ${id} is already ${job.state}`);
-    }
-    const now = this.clock.now();
-    await this.store.cancelJob(id, now);
-    await this.store.appendJobEvent(id, "cancelled", { previousState: job.state }, now);
+    const change = await this.store.cancelJob(id, this.clock.now());
+    if (!change) throw new NotFoundError(`job ${id} not found`);
+    if (!change.changed) throw new ConflictError(`job ${id} is already ${change.from}`);
     const updated = await this.getJob(id);
     this.events.emit("job.cancelled", updated);
     return updated;
   }
 
-  /** Re-run a dead or cancelled job from scratch. */
+  /**
+   * Re-run a dead or cancelled job from scratch. Checked and applied in one step: of two
+   * concurrent retries, one requeues the job and the other gets a ConflictError. A job whose
+   * unique key a newer unfinished job holds is refused (ConflictError) until that job finishes.
+   */
   async retry(id: string): Promise<Job> {
-    const job = await this.getJob(id);
-    if (job.state !== "dead" && job.state !== "cancelled") {
-      throw new ConflictError(`only dead or cancelled jobs can be retried (job is ${job.state})`);
+    const change = await this.store.retryJob(id, this.clock.now());
+    if (!change) throw new NotFoundError(`job ${id} not found`);
+    if (change.heldBy) {
+      const { jobId, uniqueKey } = change.heldBy;
+      throw new ConflictError(`job ${id} cannot be retried: job ${jobId} with the same unique key "${uniqueKey}" is unfinished`);
     }
-    const now = this.clock.now();
-    await this.store.requeueJob(id, now, true);
-    await this.store.appendJobEvent(id, "retried", { previousState: job.state }, now);
+    if (!change.changed) throw new ConflictError(`only dead or cancelled jobs can be retried (job is ${change.from})`);
     const updated = await this.getJob(id);
     this.events.emit("job.enqueued", updated);
     return updated;
   }
 
+  /** Retry the queue's dead jobs (up to `limit`). Returns how many this call retried. */
   async retryAllDead(queue: string, limit = 1000): Promise<number> {
     const page = await this.store.listJobs({ queue, state: "dead", limit });
-    for (const job of page.items) await this.retry(job.id);
-    return page.items.length;
+    let retried = 0;
+    for (const job of page.items) {
+      try {
+        await this.retry(job.id);
+        retried++;
+      } catch (err) {
+        // Retried (or removed) by someone else since the list was read: not ours to count.
+        if (!(err instanceof ConflictError || err instanceof NotFoundError)) throw err;
+      }
+    }
+    return retried;
   }
 
   async jobEvents(id: string) {

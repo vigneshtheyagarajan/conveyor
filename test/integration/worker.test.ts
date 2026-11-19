@@ -166,6 +166,96 @@ describe("running jobs", () => {
     await stopWorker(worker);
   });
 
+  // Regression: when a worker starts with jobs already waiting, all its loops claim at the same
+  // moment, and every one of them leased the same job: a worker with concurrency 4 ran the first
+  // job 4 times.
+  it("runs each job once when its loops claim at the same moment", async () => {
+    const s = await setup({ clock });
+    const jobs = await s.conveyor.enqueueBulk(Array.from({ length: 12 }, () => ({ queue: "q", name: "x" })));
+    const runs: string[] = [];
+    const handlers = new HandlerRegistry().register("x", ({ job }) => void runs.push(job.id));
+    const worker = new Worker(s.broker, { queues: ["q"], handlers, concurrency: 4, pollMs: 10, maxPollMs: 10 });
+    worker.start();
+    const states = async () => Promise.all(jobs.map((j) => s.conveyor.getJob(j.id)));
+    await until(async () => (await states()).every((x) => x.state === "completed"));
+    expect(runs.toSorted()).toEqual(jobs.map((j) => j.id).toSorted());
+    expect((await states()).map((j) => j.attempts)).toEqual(jobs.map(() => 1));
+    await stopWorker(worker);
+  });
+
+  // Previously only the loop that went idle last was woken; the others waited out their poll
+  // backoff (up to maxPollMs).
+  it("wakes every idle loop when jobs are enqueued, not just one", async () => {
+    const gate = deferred();
+    let running = 0;
+    const { conveyor, worker } = await start(
+      {
+        x: async () => {
+          running++;
+          await gate.promise;
+        },
+      },
+      { concurrency: 4, pollMs: 10, maxPollMs: 60_000 },
+    );
+    await advance(200_000, 1000); // idle long enough for every loop to back off to the maximum
+    await conveyor.enqueueBulk(Array.from({ length: 4 }, () => ({ queue: "q", name: "x" })));
+    await advance(20);
+    expect(running).toBe(4);
+    gate.resolve();
+    await stopWorker(worker);
+  });
+
+  // One enqueue wakes every idle loop; each tries to claim, and those that find nothing go back
+  // to sleep. (Waking one loop per job would also start N jobs on N loops; this pins the rule.)
+  it("wakes every idle loop for a single enqueue", async () => {
+    const gate = deferred();
+    // The handler blocks, so the loop that gets the job makes no further claims: every claim
+    // counted below comes from a different loop.
+    const { conveyor, broker, worker } = await start({ x: () => gate.promise }, { concurrency: 3, pollMs: 10, maxPollMs: 60_000 });
+    await advance(200_000, 1000);
+    const claims = vi.spyOn(broker, "claim");
+    await conveyor.enqueue({ queue: "q", name: "x" });
+    await advance(20);
+    expect(claims).toHaveBeenCalledTimes(3);
+    gate.resolve();
+    await stopWorker(worker);
+  });
+
+  it("wakes idle loops for jobs enqueued one at a time", async () => {
+    const gate = deferred();
+    let running = 0;
+    const { conveyor, worker } = await start(
+      {
+        x: async () => {
+          running++;
+          await gate.promise;
+        },
+      },
+      { concurrency: 3, pollMs: 10, maxPollMs: 60_000 },
+    );
+    await advance(200_000, 1000);
+    for (let i = 0; i < 3; i++) await conveyor.enqueue({ queue: "q", name: "x" });
+    await advance(20);
+    expect(running).toBe(3);
+    gate.resolve();
+    await stopWorker(worker);
+  });
+
+  // Resuming a paused queue used to wake nobody: its waiting jobs sat until the idle loops'
+  // poll backoff ran out (up to maxPollMs).
+  it("wakes idle loops when one of its queues is resumed", async () => {
+    const { conveyor, worker, job } = await start({ x: () => "ok" }, { pollMs: 10, maxPollMs: 60_000 });
+    await conveyor.pause("q");
+    const j = await conveyor.enqueue({ queue: "q", name: "x" });
+    await advance(200_000, 1000); // backed off to the maximum while the queue was paused
+    expect((await job(j.id)).state).toBe("waiting");
+    await conveyor.resume("q");
+    await advance(20);
+    expect((await job(j.id)).state).toBe("completed");
+    await conveyor.resume("other"); // other queues don't matter (and don't break anything)
+    await stopWorker(worker);
+  });
+
   it("wakes up as soon as a job is enqueued instead of waiting out its poll backoff", async () => {
     const { conveyor, worker, job } = await start({ x: () => "done" }, { pollMs: 10, maxPollMs: 60_000 });
     await advance(200_000, 1000); // idle long enough to back off to the maximum poll interval
@@ -238,13 +328,99 @@ describe("timeouts", () => {
     await stopWorker(worker);
   });
 
-  it("moves on to the next job even if the handler ignores the timeout", async () => {
-    const { conveyor, worker, job } = await start({ stuck: () => new Promise(() => {}), quick: () => "ok" });
+  // A handler that ignores its timeout keeps running, so its job keeps its lease (and its loop)
+  // until it stops: recording the failure earlier would let the retry run next to it. The other
+  // loops carry on.
+  it("keeps the slot and the lease of a handler that ignores its timeout; other loops carry on", async () => {
+    const { conveyor, worker, job } = await start({ stuck: () => new Promise(() => {}), quick: () => "ok" }, { concurrency: 2 });
     const stuck = await conveyor.enqueue({ queue: "q", name: "stuck", timeoutMs: 200, maxAttempts: 1 });
     const quick = await conveyor.enqueue({ queue: "q", name: "quick" });
     await until(async () => (await job(quick.id)).state === "completed");
-    expect((await job(stuck.id)).state).toBe("dead");
+    await advance(5000, 50); // far past the timeout and the 1s lease
+    expect(await job(stuck.id)).toMatchObject({ state: "active", attempts: 1, lastError: null });
+    expect(await new Maintenance(conveyor).reap()).toBe(0); // heartbeats keep the lease alive
+    expect(worker.status.running).toEqual([stuck.id]);
     await stopWorker(worker);
+  });
+
+  it("does not start the retry of a timed-out job while its handler is still running", async () => {
+    const gate = deferred();
+    let running = 0;
+    let peak = 0;
+    const { conveyor, worker, job } = await start(
+      {
+        x: async ({ job }) => {
+          peak = Math.max(peak, ++running);
+          try {
+            if (job.attempts === 1) await gate.promise; // ignores its signal
+            return `attempt ${job.attempts}`;
+          } finally {
+            running--;
+          }
+        },
+      },
+      { concurrency: 2 },
+    );
+    const m = new Maintenance(conveyor);
+    const j = await conveyor.enqueue({ queue: "q", name: "x", timeoutMs: 100, backoff: { type: "fixed", delayMs: 0 } });
+    await until(async () => (await job(j.id)).state === "active");
+    const first = await job(j.id);
+    for (let t = 0; t < 3000; t += 100) {
+      await advance(100);
+      await m.promote(); // a retry would be due at once (no backoff)
+      expect(await m.reap()).toBe(0);
+    }
+    // Still the first attempt, holding its original lease; no second run.
+    expect(await job(j.id)).toMatchObject({ state: "active", attempts: 1, leaseToken: first.leaseToken });
+    expect(peak).toBe(1);
+
+    gate.resolve(); // the handler finally returns; its result is discarded
+    await until(async () => (await job(j.id)).lastError === "job timed out after 100ms");
+    await m.promote();
+    await until(async () => (await job(j.id)).state === "completed");
+    expect(await job(j.id)).toMatchObject({ attempts: 2, result: "attempt 2" });
+    expect(peak).toBe(1);
+    await stopWorker(worker);
+  });
+
+  // An operator can cancel a job whose handler is stuck after a timeout. The lease is then gone:
+  // heartbeating stops after the first refusal instead of warning on every interval.
+  it("stops heartbeating a timed-out job whose lease was lost", async () => {
+    const { conveyor, worker, records, job } = await start({ x: () => new Promise(() => {}) }, { concurrency: 2 });
+    const j = await conveyor.enqueue({ queue: "q", name: "x", timeoutMs: 100 });
+    await until(async () => (await job(j.id)).state === "active");
+    await advance(300);
+    await conveyor.cancel(j.id);
+    await advance(2000, 50); // ten heartbeat intervals
+    expect(records.filter((r) => String(r.msg).startsWith("lease lost")).map((r) => r.msg)).toEqual(["lease lost while waiting for the handler to stop"]);
+    expect((await job(j.id)).state).toBe("cancelled");
+    await stopWorker(worker);
+  });
+
+  it("records the timeout once the handler stops, if it honours its signal", async () => {
+    const { conveyor, worker, job } = await start({ x: untilAborted });
+    const j = await conveyor.enqueue({ queue: "q", name: "x", timeoutMs: 100, backoff: { type: "fixed", delayMs: 60_000 } });
+    await until(async () => (await job(j.id)).state === "active");
+    await advance(120);
+    expect(await job(j.id)).toMatchObject({ state: "delayed", lastError: "job timed out after 100ms", leaseToken: null });
+    await stopWorker(worker);
+  });
+
+  it("on stop(), records the failure of a timed-out handler that is still running, within the grace period", async () => {
+    const { conveyor, worker, job } = await start({ x: () => new Promise(() => {}) }, { shutdownTimeoutMs: 1000 });
+    const j = await conveyor.enqueue({ queue: "q", name: "x", timeoutMs: 100, maxAttempts: 1 });
+    await until(async () => (await job(j.id)).state === "active");
+    await advance(500); // timed out; the handler ignores it
+    let stopped = false;
+    const stopping = worker.stop().then(() => (stopped = true));
+    await advance(990);
+    expect(stopped).toBe(false);
+    await advance(20);
+    expect(stopped).toBe(true);
+    await stopping;
+    // It did time out, so the attempt counts (unlike a plain shutdown, which hands the job back).
+    expect(await job(j.id)).toMatchObject({ state: "dead", lastError: "job timed out after 100ms", leaseToken: null });
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("has no time limit when timeoutMs is 0", async () => {
@@ -302,14 +478,48 @@ describe("leases while running", () => {
       { x: ({ job }) => (job.attempts === 1 ? gate.promise.then(() => "stale") : "fresh") },
       { heartbeatMs: 60_000 },
     );
-    const j = await conveyor.enqueue({ queue: "q", name: "x" });
+    const j = await conveyor.enqueue({ queue: "q", name: "x", backoff: { type: "fixed", delayMs: 0 } });
     await until(async () => (await job(j.id)).state === "active");
     clock.advance(5000); // no heartbeat within the lease
-    await new Maintenance(conveyor).reap();
+    const m = new Maintenance(conveyor);
+    await m.reap(); // a failed attempt; retried at once (no backoff)
+    await m.promote();
     gate.resolve(); // the first run finishes late; the requeued job then runs again
     await until(async () => (await job(j.id)).state === "completed");
     expect(await job(j.id)).toMatchObject({ result: "fresh", attempts: 2 });
     expect(records).toContainEqual(expect.objectContaining({ msg: "job finished after its lease was lost; result discarded" }));
+    await stopWorker(worker);
+  });
+
+  it("does not record the failure of a job whose lease was reaped and re-claimed while it ran", async () => {
+    const gate = deferred();
+    const { conveyor, worker, records, job } = await start(
+      {
+        x: ({ job }) => {
+          if (job.attempts > 1) return new Promise(() => {}); // the second run is still going
+          return gate.promise.then(() => {
+            throw new Error("stale failure");
+          });
+        },
+      },
+      { heartbeatMs: 60_000, concurrency: 2 },
+    );
+    const j = await conveyor.enqueue({ queue: "q", name: "x", backoff: { type: "fixed", delayMs: 0 } });
+    await until(async () => (await job(j.id)).state === "active");
+    clock.advance(5000); // no heartbeat within the lease
+    const m = new Maintenance(conveyor);
+    await m.reap(); // a failed attempt; retried at once (no backoff)
+    await m.promote();
+    await until(async () => (await job(j.id)).attempts === 2); // claimed again by the other loop
+    const second = await job(j.id);
+    gate.resolve(); // the first run now fails, late
+    await until(() => records.some((r) => r.msg === "job failed after its lease was lost; failure not recorded"));
+    // lastError is the reaper's note about the lost lease, not the stale run's failure.
+    expect(await job(j.id)).toMatchObject({ state: "active", leaseToken: second.leaseToken, lastError: "lease expired; worker w1 may have crashed or stalled" });
+    expect(records).not.toContainEqual(expect.objectContaining({ msg: "could not record job failure" }));
+    // The second run is still tracked (the first one's cleanup used to remove it, and stop()
+    // then waited for it forever).
+    expect(worker.status.running).toEqual([j.id]);
     await stopWorker(worker);
   });
 });
@@ -382,6 +592,27 @@ describe("shutdown", () => {
     await until(async () => (await job(j.id)).state === "active");
     await stopWorker(worker);
     expect(records).toContainEqual(expect.objectContaining({ level: "error", msg: "could not release job on shutdown" }));
+  });
+
+  // A second stop() used to return at once while the first was still waiting for running jobs,
+  // so a caller that stopped twice (two shutdown hooks, a signal during shutdown) could exit
+  // before the jobs were finished or released, leaving their leases to expire.
+  it("a second stop() waits for the same shutdown as the first", async () => {
+    const gate = deferred();
+    const { conveyor, worker, job } = await start({ x: () => gate.promise.then(() => "done") }, { shutdownTimeoutMs: 1000 });
+    const j = await conveyor.enqueue({ queue: "q", name: "x" });
+    await until(async () => (await job(j.id)).state === "active");
+    let first = false;
+    let second = false;
+    const a = worker.stop().then(() => (first = true));
+    const b = worker.stop().then(() => (second = true));
+    await advance(100);
+    expect({ first, second }).toEqual({ first: false, second: false });
+    gate.resolve();
+    await until(() => first && second);
+    await Promise.all([a, b]);
+    expect(await job(j.id)).toMatchObject({ state: "completed", result: "done" });
+    await worker.stop(); // and once stopped, stop() returns at once
   });
 
   // Regression (was KB-20): stop() waited forever for a handler that ignored its signal.
